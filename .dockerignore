@@ -1,5 +1,7 @@
 .git
 .env
+.env.*
+!.env.example
 __pycache__
 *.pyc
 *.db
@@ -7,3 +9,13 @@ __pycache__
 *.zip
 *_output/
 sca_consolidated/
+.DS_Store
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+tests/
+requirements-dev.*
+requirements*.in
+README.md
+compose.yaml

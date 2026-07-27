@@ -70,6 +70,11 @@ BUILTIN_GROUP_RULES = [
 ]
 
 DEFAULT_MAX_REPORT_BYTES = int(os.environ.get("MAX_REPORT_BYTES", str(100 * 1024 * 1024)))
+DEFAULT_MAX_JSON_DEPTH = int(os.environ.get("MAX_JSON_DEPTH", "64"))
+DEFAULT_MAX_JSON_NODES = int(os.environ.get("MAX_JSON_NODES", "250000"))
+DEFAULT_MAX_PACKAGES = int(os.environ.get("MAX_REPORT_PACKAGES", "100000"))
+DEFAULT_MAX_ROWS = int(os.environ.get("MAX_REPORT_ROWS", "50000"))
+FORMULA_PREFIXES = frozenset("=+-@\t\r\n＝＋－＠")
 
 OUTPUT_COLUMNS = [
     "Project", "Library Group", "Framework", "Primary Library", "Primary Current Version",
@@ -103,7 +108,56 @@ class PackageRef:
         return self.name or self.package_id or "Unknown package"
 
 
-def load_report(path: Path, max_json_bytes: int | None = DEFAULT_MAX_REPORT_BYTES) -> Dict[str, Any]:
+def spreadsheet_safe(value: Any) -> str:
+    """Return a string that spreadsheet programs will not evaluate as a formula."""
+    rendered = "" if value is None else str(value)
+    candidate = rendered.lstrip(" \t\r\n")
+    if candidate and candidate[0] in FORMULA_PREFIXES:
+        return "'" + rendered
+    return rendered
+
+
+def validate_json_structure(
+    value: Any,
+    max_depth: int = DEFAULT_MAX_JSON_DEPTH,
+    max_nodes: int = DEFAULT_MAX_JSON_NODES,
+) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("Report root must be a JSON object.")
+    nodes = 0
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > max_nodes:
+            raise ValueError(f"Report exceeds the structural limit of {max_nodes} JSON nodes.")
+        if depth > max_depth:
+            raise ValueError(f"Report exceeds the maximum nesting depth of {max_depth}.")
+        if isinstance(current, dict):
+            stack.extend((item, depth + 1) for item in current.values() if isinstance(item, (dict, list)))
+        elif isinstance(current, list):
+            stack.extend((item, depth + 1) for item in current if isinstance(item, (dict, list)))
+    return value
+
+
+def decode_report(
+    raw: bytes,
+    max_depth: int = DEFAULT_MAX_JSON_DEPTH,
+    max_nodes: int = DEFAULT_MAX_JSON_NODES,
+) -> Dict[str, Any]:
+    try:
+        parsed = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError("Report is not valid UTF-8 JSON within the supported nesting limit.") from exc
+    return validate_json_structure(parsed, max_depth=max_depth, max_nodes=max_nodes)
+
+
+def load_report(
+    path: Path,
+    max_json_bytes: int | None = DEFAULT_MAX_REPORT_BYTES,
+    max_depth: int = DEFAULT_MAX_JSON_DEPTH,
+    max_nodes: int = DEFAULT_MAX_JSON_NODES,
+) -> Dict[str, Any]:
     if not path.exists():
         raise SystemExit(f"ERROR: input file not found: {path}")
 
@@ -119,12 +173,18 @@ def load_report(path: Path, max_json_bytes: int | None = DEFAULT_MAX_REPORT_BYTE
                     f"ERROR: JSON report inside ZIP is too large ({info.file_size} bytes; limit {max_json_bytes} bytes)"
                 )
             with zf.open(preferred) as fh:
-                return json.loads(fh.read().decode("utf-8-sig"))
+                raw = fh.read(-1 if max_json_bytes is None else max_json_bytes + 1)
+                if max_json_bytes is not None and len(raw) > max_json_bytes:
+                    raise SystemExit(f"ERROR: JSON report inside ZIP exceeds the {max_json_bytes}-byte limit")
+                return decode_report(raw, max_depth=max_depth, max_nodes=max_nodes)
 
     if max_json_bytes is not None and path.stat().st_size > max_json_bytes:
         raise SystemExit(f"ERROR: JSON report is too large ({path.stat().st_size} bytes; limit {max_json_bytes} bytes)")
-    with path.open("r", encoding="utf-8-sig") as fh:
-        return json.load(fh)
+    with path.open("rb") as fh:
+        raw = fh.read(-1 if max_json_bytes is None else max_json_bytes + 1)
+    if max_json_bytes is not None and len(raw) > max_json_bytes:
+        raise SystemExit(f"ERROR: JSON report exceeds the {max_json_bytes}-byte limit")
+    return decode_report(raw, max_depth=max_depth, max_nodes=max_nodes)
 
 
 def as_list(value: Any) -> List[Any]:
@@ -311,14 +371,25 @@ def looks_like_vuln_id(value: str) -> bool:
     return bool(re.search(r"\b(CVE-\d{4}-\d+|CXA?[A-Za-z0-9:_\-]+|GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4})\b", value, re.I))
 
 
-def recursive_dicts(obj: Any) -> Iterable[Dict[str, Any]]:
-    if isinstance(obj, dict):
-        yield obj
-        for value in obj.values():
-            yield from recursive_dicts(value)
-    elif isinstance(obj, list):
-        for item in obj:
-            yield from recursive_dicts(item)
+def recursive_dicts(
+    obj: Any,
+    max_depth: int = DEFAULT_MAX_JSON_DEPTH,
+    max_nodes: int = DEFAULT_MAX_JSON_NODES,
+) -> Iterable[Dict[str, Any]]:
+    nodes = 0
+    stack: list[tuple[Any, int]] = [(obj, 0)]
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > max_nodes:
+            raise ValueError(f"Object exceeds the structural limit of {max_nodes} nodes.")
+        if depth > max_depth:
+            raise ValueError(f"Object exceeds the maximum nesting depth of {max_depth}.")
+        if isinstance(current, dict):
+            yield current
+            stack.extend((item, depth + 1) for item in current.values() if isinstance(item, (dict, list)))
+        elif isinstance(current, list):
+            stack.extend((item, depth + 1) for item in current if isinstance(item, (dict, list)))
 
 
 def extract_vulns(pkg: Dict[str, Any]) -> List[Tuple[str, str]]:
@@ -356,10 +427,17 @@ def vuln_cell(pkg: Dict[str, Any]) -> str:
     return "Vulnerability details not itemized in source"
 
 
-def make_rows(report: Dict[str, Any], rules: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], Dict[str, Any]]:
+def make_rows(
+    report: Dict[str, Any],
+    rules: Sequence[Dict[str, Any]],
+    max_packages: int = DEFAULT_MAX_PACKAGES,
+    max_rows: int = DEFAULT_MAX_ROWS,
+) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], Dict[str, Any]]:
     packages = report.get("Packages") or []
     if not isinstance(packages, list):
         raise SystemExit("ERROR: report does not contain a Packages[] array")
+    if len(packages) > max_packages:
+        raise ValueError(f"Report contains more than the allowed {max_packages} packages.")
 
     summary = report.get("RiskReportSummary") or {}
     project = text_or_blank(summary.get("ProjectName")) or text_or_blank(report.get("ProjectName")) or "Unknown Project"
@@ -401,6 +479,8 @@ def make_rows(report: Dict[str, Any], rules: Sequence[Dict[str, Any]]) -> Tuple[
             path_display = " > ".join(x.display for x in chain) if chain else primary.display
 
             for location in locations:
+                if len(rows) >= max_rows:
+                    raise ValueError(f"Consolidated report exceeds the {max_rows}-row limit.")
                 row = {
                     "Project": project,
                     "Library Group": group,
@@ -438,7 +518,7 @@ def write_csv(path: Path, rows: Sequence[Dict[str, str]], fieldnames: Sequence[s
         writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
-            writer.writerow(row)
+            writer.writerow({key: spreadsheet_safe(value) for key, value in row.items()})
 
 
 def make_summary(rows: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -489,7 +569,7 @@ def build_html_report(rows: Sequence[Dict[str, str]]) -> str:
     for group, items in sorted(by_group.items()):
         parts.append(f"<h2>{escape(group)}</h2><table><tr><th>Primary Library</th><th>Transitive Library / Package Path</th><th>Location / File Path</th><th>Vulnerability / CVSS Score</th><th>Latest?</th></tr>")
         for r in items:
-            latest = f"Primary: {r['Primary Is Latest?']}<br>Vulnerable: {r['Vulnerable Is Latest?']}"
+            latest = f"Primary: {escape(r['Primary Is Latest?'])}<br>Vulnerable: {escape(r['Vulnerable Is Latest?'])}"
             parts.append(
                 "<tr>"
                 + f"<td>{escape(r['Primary Library'])}</td>"
@@ -519,7 +599,7 @@ def write_xlsx_workbook(workbook: Any, sheets: Dict[str, Tuple[List[Dict[str, st
             ws.set_column(col, col, min(max(len(name) + 2, 14), 60))
         for r_idx, row in enumerate(rows, start=1):
             for c_idx, name in enumerate(columns):
-                ws.write(r_idx, c_idx, row.get(name, ""), cell_fmt)
+                ws.write_string(r_idx, c_idx, spreadsheet_safe(row.get(name, "")), cell_fmt)
         ws.freeze_panes(1, 0)
         ws.autofilter(0, 0, max(len(rows), 1), max(len(columns) - 1, 0))
 

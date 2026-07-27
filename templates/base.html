@@ -3,21 +3,22 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="theme-color" content="#140921">
+  <meta name="theme-color" content="#0f1318">
   <title>{{ title or 'SCA Report Studio' }}</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
   <script src="{{ url_for('static', filename='app.js') }}" defer></script>
 </head>
 <body>
+  {% set active_user = current_user() %}
   <header class="app-header">
     <div class="topbar">
       <a class="brand" href="{{ url_for('index') }}" aria-label="SCA Report Studio home">
         <span class="brand-mark" aria-hidden="true">Cx</span>
         <span class="brand-name">SCA Report Studio</span>
       </a>
-      {% if session.user_id %}
+      {% if active_user %}
       <div class="nav-actions">
-        <span class="user-name">{{ session.username }}</span>
+        <span class="user-name">{{ active_user }}</span>
         <form class="theme-form" method="post" action="{{ url_for('theme') }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <label class="sr-only" for="theme">Color theme</label>
@@ -28,10 +29,12 @@
           </select>
           <noscript><button class="button button-secondary" type="submit">Apply theme</button></noscript>
         </form>
+        {% if logout_enabled %}
         <form method="post" action="{{ url_for('logout') }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button class="button button-quiet" type="submit">Log out</button>
         </form>
+        {% endif %}
       </div>
       {% endif %}
     </div>

@@ -4,10 +4,18 @@ services:
     ports:
       - "8080:8080"
     environment:
+      APP_ENV: "development"
+      AUTH_MODE: "local"
       SECRET_KEY: "${SECRET_KEY:?Set SECRET_KEY in .env}"
       COOKIE_SECURE: "${COOKIE_SECURE:-false}"
       MAX_UPLOAD_BYTES: "${MAX_UPLOAD_BYTES:-26214400}"
       MAX_REPORT_BYTES: "${MAX_REPORT_BYTES:-104857600}"
+      MAX_JSON_DEPTH: "${MAX_JSON_DEPTH:-64}"
+      MAX_JSON_NODES: "${MAX_JSON_NODES:-250000}"
+      MAX_REPORT_PACKAGES: "${MAX_REPORT_PACKAGES:-100000}"
+      MAX_REPORT_ROWS: "${MAX_REPORT_ROWS:-50000}"
+      MAX_EXPORT_BYTES: "${MAX_EXPORT_BYTES:-104857600}"
+      REPORTS_PER_MINUTE: "${REPORTS_PER_MINUTE:-6}"
     volumes:
       - user-data:/data
     read_only: true

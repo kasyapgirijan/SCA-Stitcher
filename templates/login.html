@@ -6,9 +6,16 @@
     <div>
       <p class="eyebrow">Secure access</p>
       <h1>Welcome back</h1>
+      {% if needs_admin %}
+      <p>No local administrator has been provisioned. Run the protected <code>create-admin</code> CLI command before signing in.</p>
+      {% elif rate_limited %}
+      <p>Too many sign-in attempts. Wait for the retry window before trying again.</p>
+      {% else %}
       <p>Sign in to process a report. Uploaded reports are never retained.</p>
+      {% endif %}
     </div>
   </div>
+  {% if not needs_admin %}
   <form method="post" class="form-stack">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <div class="field">
@@ -21,5 +28,6 @@
     </div>
     <button class="button button-primary button-full" type="submit">Sign in</button>
   </form>
+  {% endif %}
 </section>
 {% endblock %}

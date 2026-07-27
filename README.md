@@ -2,7 +2,7 @@
 
 Python utilities for consolidating native Checkmarx SCA JSON reports into developer-friendly Excel/CSV/HTML output.
 
-The repository also includes an authenticated Docker web application for private, ephemeral report processing. Only usernames and password hashes are stored; uploads, previews, exports, and report metadata are not persisted.
+The repository also includes an authenticated Docker web application for private, ephemeral report processing. Uploads, previews, exports, and report metadata are not persisted.
 
 ## Docker web application
 
@@ -16,11 +16,21 @@ docker compose up --build
 
 Paste the generated value after `SECRET_KEY=` in `.env`. The template also documents the secure-cookie setting and report size limits. Keep `.env` local; it is ignored by Git.
 
-Open <http://localhost:8080>, create the first account, and upload a `.json` or `.zip` report. You can preview the consolidated findings, print/save the preview as PDF for sharing, or download CSV, Excel, or standalone HTML directly. The named Docker volume contains only `users.db`; report files are processed in temporary storage and deleted at the end of each request.
+Build the image, provision a local-development administrator from the protected CLI, and start the service:
 
-For HTTPS deployments, place the app behind a TLS reverse proxy and set `COOKIE_SECURE=true`. Uploads default to a 25 MiB limit, configurable with `MAX_UPLOAD_BYTES`; extracted JSON members inside ZIP uploads are capped to the same limit. CLI report parsing defaults to a 100 MiB JSON cap, configurable with `MAX_REPORT_BYTES`. Back up the `user-data` volume if accounts need to survive host replacement.
+```powershell
+docker compose build
+docker compose run --rm web flask --app web_app create-admin
+docker compose up
+```
 
-The web app now refuses to start without `SECRET_KEY` unless it is running under test configuration. This avoids accidentally creating restart-sensitive random session secrets in production.
+Open <http://localhost:8080> and upload a `.json` or `.zip` report. You can preview the consolidated findings, print/save the preview as PDF for sharing, or download CSV, Excel, or standalone HTML directly. The named Docker volume contains only the local-development `users.db`; report files are processed in temporary storage and deleted at the end of each request.
+
+The HTTP first-account setup route has been removed. Production refuses to start with local password authentication and requires verified AWS ALB OIDC/Cognito identity, secure cookies, a strong secret, and trusted hosts. Review [the production security assessment](docs/security-assessment.md), follow [the AWS production guide](docs/aws-production.md), and start from [the ECS task-definition example](aws/ecs-task-definition.example.json).
+
+Uploads default to a 25 MiB limit, configurable with `MAX_UPLOAD_BYTES`; extracted JSON members inside ZIP uploads are capped to the same limit. Depth, node, package, row, request-rate, and generated-output limits are also configurable in `.env.example`. CLI report parsing defaults to a 100 MiB JSON cap, configurable with `MAX_REPORT_BYTES`.
+
+Production dependencies are exact and hash-locked in `requirements.txt`. Regenerate the lock from `requirements.in`; development and audit tooling is isolated in `requirements-dev.txt`.
 
 The main version is:
 

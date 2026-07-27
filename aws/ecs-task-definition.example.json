@@ -1,0 +1,138 @@
+{
+  "family": "checkmarx-sca-report-studio",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": [
+    "FARGATE"
+  ],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ECS_TASK_EXECUTION_ROLE",
+  "taskRoleArn": "arn:aws:iam::ACCOUNT_ID:role/EMPTY_APPLICATION_TASK_ROLE",
+  "volumes": [
+    {
+      "name": "tmp"
+    }
+  ],
+  "containerDefinitions": [
+    {
+      "name": "web",
+      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/checkmarx-sca-report-studio@sha256:IMAGE_DIGEST",
+      "essential": true,
+      "user": "app",
+      "readonlyRootFilesystem": true,
+      "linuxParameters": {
+        "initProcessEnabled": true,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "portMappings": [
+        {
+          "name": "http",
+          "containerPort": 8080,
+          "protocol": "tcp",
+          "appProtocol": "http"
+        }
+      ],
+      "mountPoints": [
+        {
+          "sourceVolume": "tmp",
+          "containerPath": "/tmp",
+          "readOnly": false
+        }
+      ],
+      "environment": [
+        {
+          "name": "APP_ENV",
+          "value": "production"
+        },
+        {
+          "name": "AUTH_MODE",
+          "value": "alb_oidc"
+        },
+        {
+          "name": "COOKIE_SECURE",
+          "value": "true"
+        },
+        {
+          "name": "TRUSTED_HOSTS",
+          "value": "reports.example.com"
+        },
+        {
+          "name": "ALB_ARN",
+          "value": "arn:aws:elasticloadbalancing:REGION:ACCOUNT_ID:loadbalancer/app/NAME/ID"
+        },
+        {
+          "name": "ALB_CLIENT_ID",
+          "value": "OIDC_CLIENT_ID"
+        },
+        {
+          "name": "ALB_ISSUER",
+          "value": "https://EXPECTED_ISSUER"
+        },
+        {
+          "name": "ALB_LOGOUT_URL",
+          "value": "https://IDENTITY_PROVIDER/LOGOUT"
+        },
+        {
+          "name": "MAX_UPLOAD_BYTES",
+          "value": "26214400"
+        },
+        {
+          "name": "MAX_JSON_DEPTH",
+          "value": "64"
+        },
+        {
+          "name": "MAX_JSON_NODES",
+          "value": "250000"
+        },
+        {
+          "name": "MAX_REPORT_PACKAGES",
+          "value": "100000"
+        },
+        {
+          "name": "MAX_REPORT_ROWS",
+          "value": "50000"
+        },
+        {
+          "name": "MAX_EXPORT_BYTES",
+          "value": "104857600"
+        },
+        {
+          "name": "REPORTS_PER_MINUTE",
+          "value": "6"
+        },
+        {
+          "name": "SESSION_LIFETIME_MINUTES",
+          "value": "30"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "SECRET_KEY",
+          "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:checkmarx-sca-report-studio-secret"
+        }
+      ],
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).read()\" || exit 1"
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 20
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/checkmarx-sca-report-studio",
+          "awslogs-region": "REGION",
+          "awslogs-stream-prefix": "web"
+        }
+      }
+    }
+  ]
+}
