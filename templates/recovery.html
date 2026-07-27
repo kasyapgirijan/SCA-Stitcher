@@ -1,0 +1,18 @@
+{% extends 'base.html' %}
+{% block content %}
+<section class="panel auth-panel">
+  <div class="auth-heading">
+    <span class="brand-mark auth-mark" aria-hidden="true">Cx</span>
+    <div>
+      <p class="eyebrow">Account recovery</p>
+      <h1>Reset local access</h1>
+      <p>For security, password recovery is performed from the server console.</p>
+    </div>
+  </div>
+  <div class="recovery-command">
+    <code>flask --app web_app reset-password</code>
+  </div>
+  <p class="recovery-note">The temporary password must be replaced immediately after sign-in.</p>
+  <a class="button button-secondary button-full" href="{{ url_for('login') }}">Back to sign in</a>
+</section>
+{% endblock %}

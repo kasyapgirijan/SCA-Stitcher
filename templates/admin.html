@@ -1,0 +1,104 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="page-heading">
+  <div>
+    <p class="eyebrow">Local access</p>
+    <h1>User administration</h1>
+    <p>Create accounts, assign administrators, and issue temporary passwords.</p>
+  </div>
+  <span class="status-badge"><span aria-hidden="true"></span>{{ users|length }} users</span>
+</div>
+
+<div class="admin-layout">
+  <section class="panel admin-create" aria-labelledby="create-user-heading">
+    <div class="section-heading">
+      <span class="step-number" aria-hidden="true">+</span>
+      <div>
+        <h2 id="create-user-heading">Create user</h2>
+        <p>The user changes this temporary password at first sign-in.</p>
+      </div>
+    </div>
+    <form method="post" action="{{ url_for('admin_create_user') }}" class="form-stack">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <div class="field">
+        <label for="new-username">Username</label>
+        <input id="new-username" name="username" autocomplete="off" minlength="3" maxlength="128" required>
+      </div>
+      <div class="field">
+        <label for="temporary-password">Temporary password</label>
+        <input id="temporary-password" type="password" name="password" autocomplete="new-password" minlength="12" maxlength="256" required>
+      </div>
+      <div class="field">
+        <label for="temporary-password-confirm">Confirm temporary password</label>
+        <input id="temporary-password-confirm" type="password" name="confirm_password" autocomplete="new-password" minlength="12" maxlength="256" required>
+      </div>
+      <label class="check-field">
+        <input type="checkbox" name="is_admin" value="1">
+        <span>Administrator access</span>
+      </label>
+      <button class="button button-primary" type="submit">Create user</button>
+    </form>
+  </section>
+
+  <section class="panel admin-users" aria-labelledby="users-heading">
+    <div class="table-heading">
+      <div>
+        <h2 id="users-heading">Users</h2>
+        <p>Role and recovery controls apply immediately.</p>
+      </div>
+    </div>
+    <div class="table-scroll">
+      <table class="admin-table">
+        <thead>
+          <tr>
+            <th>User</th>
+            <th>Role</th>
+            <th>Status</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for user in users %}
+          <tr>
+            <td>
+              <strong>{{ user.username }}</strong>
+              {% if user.id == session.get('user_id') %}<span class="self-label">You</span>{% endif %}
+            </td>
+            <td>{{ 'Administrator' if user.is_admin else 'User' }}</td>
+            <td>{{ 'Password change required' if user.must_change_password else 'Active' }}</td>
+            <td class="admin-actions">
+              <form method="post" action="{{ url_for('admin_change_role', user_id=user.id) }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="is_admin" value="{{ 0 if user.is_admin else 1 }}">
+                <button class="button button-secondary button-small" type="submit">
+                  {{ 'Remove admin' if user.is_admin else 'Make admin' }}
+                </button>
+              </form>
+              <details class="reset-details">
+                <summary>Reset password</summary>
+                <form method="post" action="{{ url_for('admin_reset_password', user_id=user.id) }}" class="reset-form">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                  <label>
+                    <span>Temporary password</span>
+                    <input type="password" name="password" autocomplete="new-password" minlength="12" maxlength="256" required>
+                  </label>
+                  <label>
+                    <span>Confirm password</span>
+                    <input type="password" name="confirm_password" autocomplete="new-password" minlength="12" maxlength="256" required>
+                  </label>
+                  <button class="button button-primary button-small" type="submit">Reset</button>
+                </form>
+              </details>
+              <form method="post" action="{{ url_for('admin_delete_user', user_id=user.id) }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button class="button button-danger button-small" type="submit">Delete</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>
+{% endblock %}

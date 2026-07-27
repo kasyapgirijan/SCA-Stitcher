@@ -27,6 +27,7 @@
       <input id="password" type="password" name="password" autocomplete="current-password" required>
     </div>
     <button class="button button-primary button-full" type="submit">Sign in</button>
+    <a class="auth-link" href="{{ url_for('recovery') }}">Forgot your password?</a>
   </form>
   {% endif %}
 </section>

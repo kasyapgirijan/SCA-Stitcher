@@ -19,6 +19,12 @@
       {% if active_user %}
       <div class="nav-actions">
         <span class="user-name">{{ active_user }}</span>
+        {% if auth_mode == 'local' %}
+        <a class="button button-quiet nav-link" href="{{ url_for('change_password') }}">Password</a>
+        {% if current_user_is_admin() %}
+        <a class="button button-quiet nav-link" href="{{ url_for('admin') }}">Admin</a>
+        {% endif %}
+        {% endif %}
         <form class="theme-form" method="post" action="{{ url_for('theme') }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <label class="sr-only" for="theme">Color theme</label>
