@@ -2,6 +2,21 @@
 
 Python utilities for consolidating native Checkmarx SCA JSON reports into developer-friendly Excel/CSV/HTML output.
 
+The repository also includes an authenticated Docker web application for private, ephemeral report processing. Only usernames and password hashes are stored; uploads, previews, exports, and report metadata are not persisted.
+
+## Docker web application
+
+Create a local `.env` containing a long random application secret:
+
+```sh
+printf 'SECRET_KEY=%s\n' "$(python -c 'import secrets; print(secrets.token_hex(32))')" > .env
+docker compose up --build
+```
+
+Open <http://localhost:8080>, create the first account, and upload a `.json` or `.zip` report. You can preview the consolidated findings, print/save the preview as PDF for sharing, or download CSV directly. The named Docker volume contains only `users.db`; report files are processed in temporary storage and deleted at the end of each request.
+
+For HTTPS deployments, place the app behind a TLS reverse proxy and set `COOKIE_SECURE=true`. Uploads default to a 25 MiB limit, configurable with `MAX_UPLOAD_BYTES`. Back up the `user-data` volume if accounts need to survive host replacement.
+
 The main version is:
 
 ```text

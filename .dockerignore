@@ -1,0 +1,9 @@
+.git
+.env
+__pycache__
+*.pyc
+*.db
+*.json
+*.zip
+*_output/
+sca_consolidated/
