@@ -1,0 +1,17 @@
+# Local Checkmarx inputs and generated outputs
+SCA_ScanReport*.json
+*_SCA*.json
+*.zip
+sca_consolidated/
+jira_ready/
+demo_out/
+native_demo_out/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Excel temp files
+~$*.xlsx
