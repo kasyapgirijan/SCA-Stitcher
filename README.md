@@ -6,16 +6,21 @@ The repository also includes an authenticated Docker web application for private
 
 ## Docker web application
 
-Create a local `.env` containing a long random application secret:
+Copy the environment template and replace `SECRET_KEY` with a long random value:
 
-```sh
-printf 'SECRET_KEY=%s\n' "$(python -c 'import secrets; print(secrets.token_hex(32))')" > .env
+```powershell
+Copy-Item .env.example .env
+python -c "import secrets; print(secrets.token_hex(32))"
 docker compose up --build
 ```
 
-Open <http://localhost:8080>, create the first account, and upload a `.json` or `.zip` report. You can preview the consolidated findings, print/save the preview as PDF for sharing, or download CSV directly. The named Docker volume contains only `users.db`; report files are processed in temporary storage and deleted at the end of each request.
+Paste the generated value after `SECRET_KEY=` in `.env`. The template also documents the secure-cookie setting and report size limits. Keep `.env` local; it is ignored by Git.
 
-For HTTPS deployments, place the app behind a TLS reverse proxy and set `COOKIE_SECURE=true`. Uploads default to a 25 MiB limit, configurable with `MAX_UPLOAD_BYTES`. Back up the `user-data` volume if accounts need to survive host replacement.
+Open <http://localhost:8080>, create the first account, and upload a `.json` or `.zip` report. You can preview the consolidated findings, print/save the preview as PDF for sharing, or download CSV, Excel, or standalone HTML directly. The named Docker volume contains only `users.db`; report files are processed in temporary storage and deleted at the end of each request.
+
+For HTTPS deployments, place the app behind a TLS reverse proxy and set `COOKIE_SECURE=true`. Uploads default to a 25 MiB limit, configurable with `MAX_UPLOAD_BYTES`; extracted JSON members inside ZIP uploads are capped to the same limit. CLI report parsing defaults to a 100 MiB JSON cap, configurable with `MAX_REPORT_BYTES`. Back up the `user-data` volume if accounts need to survive host replacement.
+
+The web app now refuses to start without `SECRET_KEY` unless it is running under test configuration. This avoids accidentally creating restart-sensitive random session secrets in production.
 
 The main version is:
 

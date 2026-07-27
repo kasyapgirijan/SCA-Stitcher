@@ -15,17 +15,28 @@ from typing import Any, Callable
 from flask import Flask, Response, abort, flash, redirect, render_template, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 
-from checkmarx_sca_consolidator_v2 import BUILTIN_GROUP_RULES, load_report, make_rows, make_summary
+from checkmarx_sca_consolidator_v2 import (
+    BUILTIN_GROUP_RULES,
+    OUTPUT_COLUMNS,
+    SUMMARY_COLUMNS,
+    build_html_report,
+    build_xlsx_bytes,
+    load_report,
+    make_rows,
+    make_summary,
+)
 
 
 DATABASE = Path(os.environ.get("DATABASE_PATH", "/data/users.db"))
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+THEMES = ("midnight", "light", "blueprint")
 
 
 def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     app = Flask(__name__)
+    configured_secret = os.environ.get("SECRET_KEY") or (test_config or {}).get("SECRET_KEY")
     app.config.update(
-        SECRET_KEY=os.environ.get("SECRET_KEY") or secrets.token_hex(32),
+        SECRET_KEY=configured_secret or secrets.token_hex(32),
         MAX_CONTENT_LENGTH=MAX_UPLOAD_BYTES,
         DATABASE=str(DATABASE),
         SESSION_COOKIE_HTTPONLY=True,
@@ -34,6 +45,8 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     )
     if test_config:
         app.config.update(test_config)
+    if not app.config.get("TESTING") and not os.environ.get("SECRET_KEY"):
+        raise RuntimeError("Set SECRET_KEY to a long random value before starting the web app.")
 
     def db() -> sqlite3.Connection:
         path = Path(app.config["DATABASE"])
@@ -49,6 +62,8 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         return session.setdefault("csrf_token", secrets.token_urlsafe(32))
 
     app.jinja_env.globals["csrf_token"] = csrf_token
+    app.jinja_env.globals["themes"] = THEMES
+    app.jinja_env.globals["max_upload_mb"] = max(1, round(app.config["MAX_CONTENT_LENGTH"] / (1024 * 1024)))
 
     def valid_csrf() -> bool:
         expected = session.get("csrf_token", "")
@@ -68,13 +83,23 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self' 'unsafe-inline'"
+        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'"
         return response
 
     @app.get("/")
     @login_required
     def index() -> str:
         return render_template("index.html")
+
+    @app.post("/theme")
+    @login_required
+    def theme() -> Any:
+        if not valid_csrf():
+            abort(400)
+        selected = request.form.get("theme", "")
+        if selected in THEMES:
+            session["theme"] = selected
+        return redirect(request.referrer or url_for("index"))
 
     @app.route("/setup", methods=["GET", "POST"])
     def setup() -> Any:
@@ -138,14 +163,14 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             flash("Only .json and .zip files are accepted.")
             return redirect(url_for("index"))
 
-        # A temporary in-memory file is parsed and discarded before this request ends.
-        from tempfile import NamedTemporaryFile
+        # A temporary file is parsed and discarded before this request ends.
+        from tempfile import TemporaryDirectory
 
         try:
-            with NamedTemporaryFile(suffix=suffix) as source:
-                upload.save(source)
-                source.flush()
-                rows, unmapped, diagnostics = make_rows(load_report(Path(source.name)), BUILTIN_GROUP_RULES)
+            with TemporaryDirectory() as tmpdir:
+                source_path = Path(tmpdir) / f"report{suffix}"
+                upload.save(source_path)
+                rows, unmapped, diagnostics = make_rows(load_report(source_path, max_json_bytes=MAX_UPLOAD_BYTES), BUILTIN_GROUP_RULES)
         except (ValueError, OSError, KeyError, sqlite3.Error, SystemExit) as exc:
             flash(f"Could not process report: {exc}")
             return redirect(url_for("index"))
@@ -153,9 +178,16 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             flash("No reportable findings were found.")
             return redirect(url_for("index"))
 
-        if request.form.get("action") == "csv":
+        output_format = request.form.get("format") or request.form.get("action") or "preview"
+        if output_format not in {"preview", "csv", "html", "xlsx"}:
+            flash("Choose a supported output format.")
+            return redirect(url_for("index"))
+
+        summary = make_summary(rows)
+
+        if output_format == "csv":
             output = io.StringIO()
-            writer = csv.DictWriter(output, fieldnames=list(rows[0]))
+            writer = csv.DictWriter(output, fieldnames=OUTPUT_COLUMNS, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(rows)
             return Response(
@@ -163,7 +195,30 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 mimetype="text/csv",
                 headers={"Content-Disposition": "attachment; filename=checkmarx_sca_consolidated.csv"},
             )
-        return render_template("report.html", rows=rows, summary=make_summary(rows), diagnostics=diagnostics, unmapped=len(unmapped))
+        if output_format == "html":
+            return Response(
+                build_html_report(rows),
+                mimetype="text/html",
+                headers={"Content-Disposition": "attachment; filename=checkmarx_sca_consolidated.html"},
+            )
+        if output_format == "xlsx":
+            payload = build_xlsx_bytes(
+                {
+                    "Consolidated": (rows, OUTPUT_COLUMNS),
+                    "Summary": (summary, SUMMARY_COLUMNS),
+                    "Unmapped": (unmapped, OUTPUT_COLUMNS),
+                    "Diagnostics": ([{k: str(v) for k, v in diagnostics.items()}], list(diagnostics.keys())),
+                }
+            )
+            if payload is None:
+                flash("Excel export is not available because XlsxWriter is not installed.")
+                return redirect(url_for("index"))
+            return Response(
+                payload,
+                mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                headers={"Content-Disposition": "attachment; filename=checkmarx_sca_consolidated.xlsx"},
+            )
+        return render_template("report.html", rows=rows, summary=summary, diagnostics=diagnostics, unmapped=len(unmapped))
 
     return app
 

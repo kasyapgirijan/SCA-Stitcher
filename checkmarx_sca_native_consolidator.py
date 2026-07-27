@@ -42,6 +42,7 @@ import argparse
 import hashlib
 import html
 import json
+import os
 import re
 import sys
 import zipfile
@@ -89,6 +90,8 @@ PATH_KEYS = (
     "Nodes",
     "Chain",
 )
+
+DEFAULT_MAX_REPORT_BYTES = int(os.environ.get("MAX_REPORT_BYTES", str(100 * 1024 * 1024)))
 
 
 class ConsolidationError(RuntimeError):
@@ -708,9 +711,13 @@ code { font-family: Consolas, monospace; font-size: 12px; }
     (out_dir / "consolidated_preview.html").write_text(page, encoding="utf-8")
 
 
-def load_json(path: Path) -> dict[str, Any]:
+def load_json(path: Path, max_json_bytes: int | None = DEFAULT_MAX_REPORT_BYTES) -> dict[str, Any]:
     if not path.exists():
         raise ConsolidationError(f"Input file does not exist: {path}")
+    if max_json_bytes is not None and path.stat().st_size > max_json_bytes:
+        raise ConsolidationError(
+            f"Input file is too large ({path.stat().st_size} bytes; limit {max_json_bytes} bytes)."
+        )
     raw = path.read_bytes()
     if raw[:4] == b"PK\x03\x04":
         with zipfile.ZipFile(BytesIO(raw)) as archive:
@@ -718,6 +725,11 @@ def load_json(path: Path) -> dict[str, Any]:
             if not json_files:
                 raise ConsolidationError("The ZIP does not contain a JSON report.")
             preferred = next((name for name in json_files if "scanreport" in name.lower()), json_files[0])
+            info = archive.getinfo(preferred)
+            if max_json_bytes is not None and info.file_size > max_json_bytes:
+                raise ConsolidationError(
+                    f"JSON report inside ZIP is too large ({info.file_size} bytes; limit {max_json_bytes} bytes)."
+                )
             raw = archive.read(preferred)
     try:
         data = json.loads(raw.decode("utf-8-sig"))

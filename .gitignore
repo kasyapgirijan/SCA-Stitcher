@@ -13,5 +13,9 @@ __pycache__/
 .venv/
 venv/
 
+# Local environment secrets
+.env
+!.env.example
+
 # Excel temp files
 ~$*.xlsx

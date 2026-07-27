@@ -1,1 +1,77 @@
-{% extends 'base.html' %}{% block content %}<section class="card"><p>PRIVATE · EPHEMERAL · EXPORTABLE</p><h1>Turn scan noise into an actionable report.</h1><p>Upload a native Checkmarx SCA JSON export or ZIP. Processing happens only for this request; the server stores no uploads, generated reports, or report metadata.</p><form method="post" action="{{ url_for('report') }}" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><label>Checkmarx report</label><input type="file" name="report" accept=".json,.zip,application/json,application/zip" required><p class="actions"><button name="action" value="preview">Create private preview</button><button class="secondary" name="action" value="csv">Download CSV directly</button></p></form></section><section class="card"><h2>Privacy by design</h2><p>Only login credentials are persisted. Report bytes live in a temporary file during processing and are deleted as soon as the request completes. Preview responses use <code>Cache-Control: no-store</code>.</p></section>{% endblock %}
+{% extends 'base.html' %}
+{% block content %}
+<div class="page-heading">
+  <div>
+    <p class="eyebrow">Checkmarx SCA</p>
+    <h1>Report workspace</h1>
+    <p>Group vulnerable dependencies into a remediation-ready report.</p>
+  </div>
+  <span class="status-badge"><span aria-hidden="true"></span>Private processing</span>
+</div>
+
+<form method="post" action="{{ url_for('report') }}" enctype="multipart/form-data" class="workspace" data-report-form>
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+  <section class="panel upload-panel" aria-labelledby="upload-title">
+    <div class="section-heading">
+      <span class="step-number">1</span>
+      <div>
+        <h2 id="upload-title">Choose a scan export</h2>
+        <p>Native Checkmarx SCA JSON or a ZIP containing the report.</p>
+      </div>
+    </div>
+
+    <label class="upload-zone" for="report" data-upload-zone>
+      <input id="report" type="file" name="report" accept=".json,.zip,application/json,application/zip" required data-report-file>
+      <span class="upload-title">Select a JSON or ZIP file</span>
+      <span class="upload-detail" data-file-name>or drag and drop it here</span>
+      <span class="file-types"><span>JSON</span><span>ZIP</span><span>Up to {{ max_upload_mb }} MB</span></span>
+    </label>
+  </section>
+
+  <section class="panel format-panel" aria-labelledby="format-title">
+    <div class="section-heading">
+      <span class="step-number">2</span>
+      <div>
+        <h2 id="format-title">Choose the output</h2>
+        <p>Preview privately or extract a file for your team.</p>
+      </div>
+    </div>
+
+    <fieldset class="format-grid">
+      <legend class="sr-only">Output format</legend>
+      <label class="format-option">
+        <input type="radio" name="format" value="preview" checked>
+        <span class="format-copy"><strong>Browser preview</strong><small>Review findings before sharing</small></span>
+        <span class="format-tag">Preview</span>
+      </label>
+      <label class="format-option">
+        <input type="radio" name="format" value="xlsx">
+        <span class="format-copy"><strong>Excel workbook</strong><small>Multiple sheets for analysis</small></span>
+        <span class="format-tag">.xlsx</span>
+      </label>
+      <label class="format-option">
+        <input type="radio" name="format" value="csv">
+        <span class="format-copy"><strong>CSV extract</strong><small>Flat data for tools and imports</small></span>
+        <span class="format-tag">.csv</span>
+      </label>
+      <label class="format-option">
+        <input type="radio" name="format" value="html">
+        <span class="format-copy"><strong>HTML report</strong><small>Standalone, shareable report</small></span>
+        <span class="format-tag">.html</span>
+      </label>
+    </fieldset>
+  </section>
+
+  <div class="submit-bar">
+    <div class="privacy-note">
+      <strong>Reports are not retained.</strong>
+      <span>The upload is deleted when this request finishes.</span>
+    </div>
+    <button class="button button-primary process-button" type="submit" data-submit-report>
+      <span data-submit-label>Build preview</span>
+      <span class="button-arrow" aria-hidden="true">→</span>
+    </button>
+  </div>
+</form>
+{% endblock %}

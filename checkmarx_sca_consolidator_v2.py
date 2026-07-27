@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
+import os
 import re
 import sys
 import zipfile
@@ -67,6 +69,18 @@ BUILTIN_GROUP_RULES = [
     {"name": "BIRT", "framework": "BIRT", "patterns": [r"birt"]},
 ]
 
+DEFAULT_MAX_REPORT_BYTES = int(os.environ.get("MAX_REPORT_BYTES", str(100 * 1024 * 1024)))
+
+OUTPUT_COLUMNS = [
+    "Project", "Library Group", "Framework", "Primary Library", "Primary Current Version",
+    "Primary Latest Version", "Primary Is Latest?", "Vulnerable Library", "Vulnerable Current Version",
+    "Vulnerable Latest Version", "Vulnerable Is Latest?", "Dependency Type", "Package Path",
+    "Location / File Path", "Vulnerability / CVSS Score", "Mapping Source", "Group Reason",
+    "Critical Count", "High Count", "Medium Count", "Low Count",
+]
+
+SUMMARY_COLUMNS = ["Library Group", "Framework", "Primary Versions", "Vulnerable Library Count", "Location Count", "Rows"]
+
 
 @dataclass
 class PackageRef:
@@ -89,7 +103,7 @@ class PackageRef:
         return self.name or self.package_id or "Unknown package"
 
 
-def load_report(path: Path) -> Dict[str, Any]:
+def load_report(path: Path, max_json_bytes: int | None = DEFAULT_MAX_REPORT_BYTES) -> Dict[str, Any]:
     if not path.exists():
         raise SystemExit(f"ERROR: input file not found: {path}")
 
@@ -99,9 +113,16 @@ def load_report(path: Path) -> Dict[str, Any]:
             if not json_names:
                 raise SystemExit("ERROR: ZIP does not contain a JSON report")
             preferred = sorted(json_names, key=lambda n: ("sca" not in n.lower(), len(n)))[0]
+            info = zf.getinfo(preferred)
+            if max_json_bytes is not None and info.file_size > max_json_bytes:
+                raise SystemExit(
+                    f"ERROR: JSON report inside ZIP is too large ({info.file_size} bytes; limit {max_json_bytes} bytes)"
+                )
             with zf.open(preferred) as fh:
                 return json.loads(fh.read().decode("utf-8-sig"))
 
+    if max_json_bytes is not None and path.stat().st_size > max_json_bytes:
+        raise SystemExit(f"ERROR: JSON report is too large ({path.stat().st_size} bytes; limit {max_json_bytes} bytes)")
     with path.open("r", encoding="utf-8-sig") as fh:
         return json.load(fh)
 
@@ -120,15 +141,22 @@ def text_or_blank(value: Any) -> str:
     return str(value).strip()
 
 
+def as_int(value: Any) -> int:
+    try:
+        return int(float(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def name_version_key(name: str, version: str) -> str:
     return f"{name.strip().lower()}@{version.strip().lower()}"
 
 
 def vuln_count(pkg: Dict[str, Any]) -> int:
     explicit = pkg.get("VulnerabilityCount")
-    if isinstance(explicit, int):
-        return explicit
-    return sum(int(pkg.get(k) or 0) for k in SEVERITY_FIELDS)
+    if explicit not in (None, ""):
+        return as_int(explicit)
+    return sum(as_int(pkg.get(k)) for k in SEVERITY_FIELDS)
 
 
 def is_reportable(pkg: Dict[str, Any]) -> bool:
@@ -322,7 +350,7 @@ def vuln_cell(pkg: Dict[str, Any]) -> str:
     vulns = extract_vulns(pkg)
     if vulns:
         return "\n".join(f"{vid} | CVSS {score}" if score else vid for vid, score in vulns)
-    counts = {k.replace("VulnerabilityCount", ""): int(pkg.get(k) or 0) for k in SEVERITY_FIELDS if int(pkg.get(k) or 0)}
+    counts = {k.replace("VulnerabilityCount", ""): as_int(pkg.get(k)) for k in SEVERITY_FIELDS if as_int(pkg.get(k))}
     if counts:
         return "Vulnerability details not itemized in source; counts: " + ", ".join(f"{k}={v}" for k, v in counts.items())
     return "Vulnerability details not itemized in source"
@@ -391,10 +419,10 @@ def make_rows(report: Dict[str, Any], rules: Sequence[Dict[str, Any]]) -> Tuple[
                     "Vulnerability / CVSS Score": vuln_cell(pkg),
                     "Mapping Source": mapping_source,
                     "Group Reason": group_reason,
-                    "Critical Count": str(int(pkg.get("CriticalVulnerabilityCount") or 0)),
-                    "High Count": str(int(pkg.get("HighVulnerabilityCount") or 0)),
-                    "Medium Count": str(int(pkg.get("MediumVulnerabilityCount") or 0)),
-                    "Low Count": str(int(pkg.get("LowVulnerabilityCount") or 0)),
+                    "Critical Count": str(as_int(pkg.get("CriticalVulnerabilityCount"))),
+                    "High Count": str(as_int(pkg.get("HighVulnerabilityCount"))),
+                    "Medium Count": str(as_int(pkg.get("MediumVulnerabilityCount"))),
+                    "Low Count": str(as_int(pkg.get("LowVulnerabilityCount"))),
                 }
                 rows.append(row)
                 if is_unmapped or primary.name == "Unmapped Primary Library":
@@ -449,7 +477,7 @@ def make_summary(rows: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
     return out
 
 
-def write_html(path: Path, rows: Sequence[Dict[str, str]]) -> None:
+def build_html_report(rows: Sequence[Dict[str, str]]) -> str:
     by_group: Dict[str, List[Dict[str, str]]] = defaultdict(list)
     for row in rows:
         by_group[row["Library Group"]].append(row)
@@ -473,17 +501,15 @@ def write_html(path: Path, rows: Sequence[Dict[str, str]]) -> None:
             )
         parts.append("</table>")
     parts.append("</body></html>")
-    path.write_text("\n".join(parts), encoding="utf-8")
+    return "\n".join(parts)
 
 
-def write_xlsx(path: Path, sheets: Dict[str, Tuple[List[Dict[str, str]], List[str]]]) -> bool:
-    try:
-        import xlsxwriter  # type: ignore
-    except Exception:
-        return False
+def write_html(path: Path, rows: Sequence[Dict[str, str]]) -> None:
+    path.write_text(build_html_report(rows), encoding="utf-8")
 
-    workbook = xlsxwriter.Workbook(str(path))
-    header_fmt = workbook.add_format({"bold": True, "bg_color": "#1F4E78", "font_color": "white", "border": 1})
+
+def write_xlsx_workbook(workbook: Any, sheets: Dict[str, Tuple[List[Dict[str, str]], List[str]]]) -> None:
+    header_fmt = workbook.add_format({"bold": True, "bg_color": "#006BD5", "font_color": "white", "border": 1})
     cell_fmt = workbook.add_format({"text_wrap": True, "valign": "top", "border": 1})
 
     for sheet_name, (rows, columns) in sheets.items():
@@ -497,6 +523,28 @@ def write_xlsx(path: Path, sheets: Dict[str, Tuple[List[Dict[str, str]], List[st
         ws.freeze_panes(1, 0)
         ws.autofilter(0, 0, max(len(rows), 1), max(len(columns) - 1, 0))
 
+
+def build_xlsx_bytes(sheets: Dict[str, Tuple[List[Dict[str, str]], List[str]]]) -> bytes | None:
+    try:
+        import xlsxwriter  # type: ignore
+    except Exception:
+        return None
+
+    output = io.BytesIO()
+    workbook = xlsxwriter.Workbook(output, {"in_memory": True})
+    write_xlsx_workbook(workbook, sheets)
+    workbook.close()
+    return output.getvalue()
+
+
+def write_xlsx(path: Path, sheets: Dict[str, Tuple[List[Dict[str, str]], List[str]]]) -> bool:
+    try:
+        import xlsxwriter  # type: ignore
+    except Exception:
+        return False
+
+    workbook = xlsxwriter.Workbook(str(path))
+    write_xlsx_workbook(workbook, sheets)
     workbook.close()
     return True
 
@@ -520,28 +568,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         (out_dir / "schema_diagnostics.json").write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
         return 2
 
-    columns = [
-        "Project", "Library Group", "Framework", "Primary Library", "Primary Current Version",
-        "Primary Latest Version", "Primary Is Latest?", "Vulnerable Library", "Vulnerable Current Version",
-        "Vulnerable Latest Version", "Vulnerable Is Latest?", "Dependency Type", "Package Path",
-        "Location / File Path", "Vulnerability / CVSS Score", "Mapping Source", "Group Reason",
-        "Critical Count", "High Count", "Medium Count", "Low Count",
-    ]
     summary = make_summary(rows)
-    summary_cols = ["Library Group", "Framework", "Primary Versions", "Vulnerable Library Count", "Location Count", "Rows"]
 
-    write_csv(out_dir / "checkmarx_sca_consolidated.csv", rows, columns)
-    write_csv(out_dir / "library_group_summary.csv", summary, summary_cols)
-    write_csv(out_dir / "unmapped_libraries.csv", unmapped, columns)
+    write_csv(out_dir / "checkmarx_sca_consolidated.csv", rows, OUTPUT_COLUMNS)
+    write_csv(out_dir / "library_group_summary.csv", summary, SUMMARY_COLUMNS)
+    write_csv(out_dir / "unmapped_libraries.csv", unmapped, OUTPUT_COLUMNS)
     write_html(out_dir / "consolidated_preview.html", rows)
     (out_dir / "schema_diagnostics.json").write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
 
     xlsx_written = write_xlsx(
         out_dir / "checkmarx_sca_consolidated.xlsx",
         {
-            "Consolidated": (rows, columns),
-            "Summary": (summary, summary_cols),
-            "Unmapped": (unmapped, columns),
+            "Consolidated": (rows, OUTPUT_COLUMNS),
+            "Summary": (summary, SUMMARY_COLUMNS),
+            "Unmapped": (unmapped, OUTPUT_COLUMNS),
             "Diagnostics": ([{k: str(v) for k, v in diagnostics.items()}], list(diagnostics.keys())),
         },
     )

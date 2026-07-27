@@ -1,1 +1,90 @@
-{% extends 'base.html' %}{% block content %}<div class="no-print actions"><a class="button secondary" href="{{ url_for('index') }}">← Process another</a><button onclick="window.print()">Print / save PDF / share</button></div><section class="card"><h1>{{ diagnostics.project }}</h1><p>{{ diagnostics.rows_generated }} consolidated rows · {{ diagnostics.reportable_packages }} reportable packages · {{ unmapped }} unmapped rows. This page is not saved by the server.</p><h2>Library groups</h2><div class="scroll"><table><thead><tr>{% for key in summary[0] %}<th>{{ key }}</th>{% endfor %}</tr></thead><tbody>{% for row in summary %}<tr>{% for value in row.values() %}<td>{{ value }}</td>{% endfor %}</tr>{% endfor %}</tbody></table></div></section><section class="card"><h2>Consolidated findings</h2><div class="scroll"><table><thead><tr>{% for key in rows[0] %}<th>{{ key }}</th>{% endfor %}</tr></thead><tbody>{% for row in rows %}<tr>{% for value in row.values() %}<td style="white-space:pre-wrap">{{ value }}</td>{% endfor %}</tr>{% endfor %}</tbody></table></div></section>{% endblock %}
+{% extends 'base.html' %}
+{% block content %}
+<div class="report-toolbar no-print">
+  <a class="button button-secondary" href="{{ url_for('index') }}">← New report</a>
+  <button class="button button-primary" type="button" data-print-report>Print or save PDF</button>
+</div>
+
+<section class="report-heading">
+  <div>
+    <p class="eyebrow">Private preview</p>
+    <h1>{{ diagnostics.project or 'SCA consolidated report' }}</h1>
+    <p>Grouped dependency findings ready for remediation review.</p>
+  </div>
+  <span class="status-badge"><span aria-hidden="true"></span>Generated locally</span>
+</section>
+
+<section class="stats" aria-label="Report summary">
+  <div class="stat"><span>Consolidated rows</span><strong>{{ diagnostics.rows_generated }}</strong></div>
+  <div class="stat"><span>Reportable packages</span><strong>{{ diagnostics.reportable_packages }}</strong></div>
+  <div class="stat"><span>Direct packages</span><strong>{{ diagnostics.direct_packages }}</strong></div>
+  <div class="stat {% if unmapped %}stat-warning{% endif %}"><span>Unmapped rows</span><strong>{{ unmapped }}</strong></div>
+</section>
+
+<section class="panel table-panel">
+  <div class="table-heading">
+    <div>
+      <h2>Library groups</h2>
+      <p>Roll-up of findings by primary dependency group.</p>
+    </div>
+    <span class="row-count">{{ summary|length }} groups</span>
+  </div>
+  {% if summary %}
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr>{% for key in summary[0] %}<th scope="col">{{ key }}</th>{% endfor %}</tr>
+      </thead>
+      <tbody>
+        {% for row in summary %}
+        <tr>{% for value in row.values() %}<td>{{ value }}</td>{% endfor %}</tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty-state">No library groups were generated.</p>
+  {% endif %}
+</section>
+
+<section class="panel table-panel">
+  <div class="table-heading">
+    <div>
+      <h2>Consolidated findings</h2>
+      <p>Detailed package paths, versions, vulnerabilities, and severity counts.</p>
+    </div>
+    <span class="row-count">{{ rows|length }} findings</span>
+  </div>
+  {% if rows %}
+  <div class="table-scroll table-scroll-large">
+    <table>
+      <thead>
+        <tr>{% for key in rows[0] %}<th scope="col">{{ key }}</th>{% endfor %}</tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          {% for key, value in row.items() %}
+          {% set count = value|int %}
+          {% set severity_class = '' %}
+          {% if key == 'Critical Count' and count > 0 %}
+            {% set severity_class = 'severity-critical' %}
+          {% elif key == 'High Count' and count > 0 %}
+            {% set severity_class = 'severity-high' %}
+          {% elif key == 'Medium Count' and count > 0 %}
+            {% set severity_class = 'severity-medium' %}
+          {% elif key == 'Low Count' and count > 0 %}
+            {% set severity_class = 'severity-low' %}
+          {% endif %}
+          <td class="data-cell {{ severity_class }}">{{ value }}</td>
+          {% endfor %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty-state">No consolidated findings were generated.</p>
+  {% endif %}
+</section>
+{% endblock %}

@@ -1,1 +1,25 @@
-{% extends 'base.html' %}{% block content %}<section class="card" style="max-width:480px;margin:8vh auto"><h1>Welcome back.</h1><p>Sign in to process a report. Uploaded reports are never retained.</p><form method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><label>Username</label><input name="username" autocomplete="username" required><label>Password</label><input type="password" name="password" autocomplete="current-password" required><p><button>Sign in</button></p></form></section>{% endblock %}
+{% extends 'base.html' %}
+{% block content %}
+<section class="panel auth-panel">
+  <div class="auth-heading">
+    <span class="brand-mark auth-mark" aria-hidden="true">Cx</span>
+    <div>
+      <p class="eyebrow">Secure access</p>
+      <h1>Welcome back</h1>
+      <p>Sign in to process a report. Uploaded reports are never retained.</p>
+    </div>
+  </div>
+  <form method="post" class="form-stack">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <div class="field">
+      <label for="username">Username</label>
+      <input id="username" name="username" autocomplete="username" autofocus required>
+    </div>
+    <div class="field">
+      <label for="password">Password</label>
+      <input id="password" type="password" name="password" autocomplete="current-password" required>
+    </div>
+    <button class="button button-primary button-full" type="submit">Sign in</button>
+  </form>
+</section>
+{% endblock %}

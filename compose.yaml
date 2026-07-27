@@ -6,6 +6,8 @@ services:
     environment:
       SECRET_KEY: "${SECRET_KEY:?Set SECRET_KEY in .env}"
       COOKIE_SECURE: "${COOKIE_SECURE:-false}"
+      MAX_UPLOAD_BYTES: "${MAX_UPLOAD_BYTES:-26214400}"
+      MAX_REPORT_BYTES: "${MAX_REPORT_BYTES:-104857600}"
     volumes:
       - user-data:/data
     read_only: true
