@@ -746,4 +746,5 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
 app = create_app()
 
 if __name__ == "__main__":
-    app.run(host=os.environ.get("WEB_HOST", "0.0.0.0"), port=8080)
+    # Deliberate LAN bind for local use; production runs behind the authenticated ALB.
+    app.run(host=os.environ.get("WEB_HOST", "0.0.0.0"), port=8080)  # nosec B104

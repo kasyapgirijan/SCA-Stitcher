@@ -6,7 +6,7 @@
     <h1>User administration</h1>
     <p>Create accounts, assign administrators, and issue temporary passwords.</p>
   </div>
-  <span class="status-badge"><span aria-hidden="true"></span>{{ users|length }} users</span>
+  <span class="status-badge"><span aria-hidden="true"></span>{{ users|length }} {{ 'user' if users|length == 1 else 'users' }}</span>
 </div>
 
 <div class="admin-layout">
@@ -67,6 +67,7 @@
             <td>{{ 'Administrator' if user.is_admin else 'User' }}</td>
             <td>{{ 'Password change required' if user.must_change_password else 'Active' }}</td>
             <td class="admin-actions">
+              {% if user.id != session.get('user_id') %}
               <form method="post" action="{{ url_for('admin_change_role', user_id=user.id) }}">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <input type="hidden" name="is_admin" value="{{ 0 if user.is_admin else 1 }}">
@@ -74,6 +75,7 @@
                   {{ 'Remove admin' if user.is_admin else 'Make admin' }}
                 </button>
               </form>
+              {% endif %}
               <details class="reset-details">
                 <summary>Reset password</summary>
                 <form method="post" action="{{ url_for('admin_reset_password', user_id=user.id) }}" class="reset-form">
@@ -89,10 +91,12 @@
                   <button class="button button-primary button-small" type="submit">Reset</button>
                 </form>
               </details>
+              {% if user.id != session.get('user_id') %}
               <form method="post" action="{{ url_for('admin_delete_user', user_id=user.id) }}">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <button class="button button-danger button-small" type="submit">Delete</button>
               </form>
+              {% endif %}
             </td>
           </tr>
           {% endfor %}

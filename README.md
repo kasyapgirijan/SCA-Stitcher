@@ -28,6 +28,14 @@ Open <http://localhost:8080> and upload a `.json` or `.zip` report. You can prev
 
 The HTTP first-account setup route has been removed. Production refuses to start with local password authentication and requires verified AWS ALB OIDC/Cognito identity, secure cookies, a strong secret, and trusted hosts. Review [the production security assessment](docs/security-assessment.md), follow [the AWS production guide](docs/aws-production.md), and start from [the ECS task-definition example](aws/ecs-task-definition.example.json).
 
+Local administrators can manage accounts at `/admin`. Users created or reset there
+must replace their temporary password at the next sign-in. If every administrator
+is locked out, recover an existing local account from the server console:
+
+```powershell
+flask --app web_app reset-password
+```
+
 Uploads default to a 25 MiB limit, configurable with `MAX_UPLOAD_BYTES`; extracted JSON members inside ZIP uploads are capped to the same limit. Depth, node, package, row, request-rate, and generated-output limits are also configurable in `.env.example`. CLI report parsing defaults to a 100 MiB JSON cap, configurable with `MAX_REPORT_BYTES`.
 
 Production dependencies are exact and hash-locked in `requirements.txt`. Regenerate the lock from `requirements.in`; development and audit tooling is isolated in `requirements-dev.txt`.

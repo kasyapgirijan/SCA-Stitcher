@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import sqlite3
 import time
 import zipfile
 from io import BytesIO
@@ -107,6 +108,95 @@ def test_auth_and_ephemeral_preview(app, client, tmp_path):
     assert b"CVE-2026-1234" in response.data
     assert response.headers["Cache-Control"] == "no-store"
     assert not list(tmp_path.glob("*.json"))
+
+
+def test_cli_password_recovery_forces_password_change(app, client):
+    create_admin(app)
+    reset = app.test_cli_runner().invoke(
+        args=["reset-password"],
+        input="reviewer\ntemporary-password-2026\ntemporary-password-2026\n",
+    )
+    assert reset.exit_code == 0, reset.output
+
+    response = client.get("/login")
+    response = client.post(
+        "/login",
+        data={
+            "csrf_token": token(response),
+            "username": "reviewer",
+            "password": "temporary-password-2026",
+        },
+    )
+    assert response.status_code == 302
+    forced = client.get("/")
+    assert forced.status_code == 302
+    assert forced.headers["Location"].endswith("/change-password")
+
+    page = client.get("/change-password")
+    changed = client.post(
+        "/change-password",
+        data={
+            "csrf_token": token(page),
+            "current_password": "temporary-password-2026",
+            "new_password": "replacement-password-2026",
+            "confirm_password": "replacement-password-2026",
+        },
+    )
+    assert changed.status_code == 302
+    assert client.get("/").status_code == 200
+
+
+def test_admin_panel_creates_regular_user_and_enforces_role(app, client):
+    register_and_login(app, client)
+    page = client.get("/admin")
+    assert page.status_code == 200
+    created = client.post(
+        "/admin/users",
+        data={
+            "csrf_token": token(page),
+            "username": "analyst",
+            "password": "temporary-password-2026",
+            "confirm_password": "temporary-password-2026",
+        },
+        follow_redirects=True,
+    )
+    assert created.status_code == 200
+    assert b"Created analyst" in created.data
+
+    analyst = app.test_client()
+    response = analyst.get("/login")
+    analyst.post(
+        "/login",
+        data={
+            "csrf_token": token(response),
+            "username": "analyst",
+            "password": "temporary-password-2026",
+        },
+    )
+    change_page = analyst.get("/change-password")
+    analyst.post(
+        "/change-password",
+        data={
+            "csrf_token": token(change_page),
+            "current_password": "temporary-password-2026",
+            "new_password": "analyst-password-2026",
+            "confirm_password": "analyst-password-2026",
+        },
+    )
+    assert analyst.get("/admin").status_code == 403
+
+
+def test_admin_cannot_delete_own_account(app, client):
+    register_and_login(app, client)
+    page = client.get("/admin")
+    response = client.post(
+        "/admin/users/1/delete",
+        data={"csrf_token": token(page)},
+        follow_redirects=True,
+    )
+    assert b"cannot delete your own" in response.data
+    with sqlite3.connect(app.config["DATABASE"]) as connection:
+        assert connection.execute("SELECT count(*) FROM users").fetchone()[0] == 1
 
 
 def test_workspace_ui_exposes_formats_and_strict_styles(app, client):
