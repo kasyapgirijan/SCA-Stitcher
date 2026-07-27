@@ -1,0 +1,20 @@
+{
+  "groups": [
+    {
+      "name": "ESLint",
+      "framework": "ESLint",
+      "patterns": [
+        "(?:^|[^a-z0-9])eslint(?:$|[^a-z0-9])",
+        "(?:^|[^a-z0-9])eslint-",
+        "(?:^|[^a-z0-9])eslint/"
+      ]
+    },
+    {
+      "name": "BIRT",
+      "framework": "BIRT",
+      "patterns": [
+        "birt"
+      ]
+    }
+  ]
+}
