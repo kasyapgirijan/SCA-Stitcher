@@ -513,6 +513,27 @@ p {
   width: 100%;
 }
 
+.button-small {
+  min-height: 32px;
+  padding: 6px 9px;
+  font-size: .76rem;
+}
+
+.button-danger {
+  border-color: color-mix(in srgb, var(--critical) 55%, var(--line));
+  background: transparent;
+  color: var(--critical);
+}
+
+.button-danger:hover {
+  border-color: var(--critical);
+  background: color-mix(in srgb, var(--critical) 10%, var(--surface));
+}
+
+.nav-link {
+  min-height: 38px;
+}
+
 input:focus-visible,
 select:focus-visible,
 button:focus-visible,
@@ -563,6 +584,13 @@ a:focus-visible {
   gap: 17px;
 }
 
+.auth-link {
+  color: var(--brand-hover);
+  font-size: .84rem;
+  font-weight: 700;
+  text-align: center;
+}
+
 .field label {
   display: block;
   margin-bottom: 6px;
@@ -585,6 +613,136 @@ a:focus-visible {
   margin-top: 5px;
   color: var(--muted);
   font-size: .76rem;
+}
+
+.recovery-command {
+  margin-bottom: 13px;
+  padding: 13px 14px;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-raised);
+  color: var(--muted-strong);
+}
+
+.recovery-note {
+  margin-bottom: 18px;
+  font-size: .84rem;
+}
+
+.admin-layout {
+  display: grid;
+  grid-template-columns: minmax(280px, 340px) minmax(0, 1fr);
+  align-items: start;
+  gap: 16px;
+}
+
+.admin-create {
+  position: sticky;
+  top: 100px;
+}
+
+.check-field {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--muted-strong);
+  font-size: .86rem;
+  font-weight: 700;
+}
+
+.check-field input {
+  width: 17px;
+  height: 17px;
+  margin: 0;
+  accent-color: var(--brand);
+}
+
+.admin-table {
+  min-width: 760px;
+}
+
+.admin-table td:first-child {
+  min-width: 150px;
+}
+
+.self-label {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 2px 5px;
+  border-radius: 4px;
+  background: var(--brand-soft);
+  color: var(--brand-hover);
+  font-size: .67rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.admin-actions {
+  min-width: 290px;
+}
+
+.admin-actions > form {
+  display: inline-block;
+  margin: 0 5px 5px 0;
+}
+
+.reset-details {
+  display: inline-block;
+  margin: 0 5px 5px 0;
+  vertical-align: top;
+}
+
+.reset-details summary {
+  min-height: 32px;
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-raised);
+  color: var(--ink);
+  font-size: .76rem;
+  font-weight: 750;
+  cursor: pointer;
+  list-style: none;
+}
+
+.reset-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.reset-details[open] {
+  display: block;
+  margin-top: 6px;
+}
+
+.reset-form {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) minmax(150px, 1fr) auto;
+  align-items: end;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-raised);
+}
+
+.reset-form label span {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: .7rem;
+  font-weight: 700;
+}
+
+.reset-form input {
+  width: 100%;
+  min-height: 34px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--ink);
 }
 
 .report-toolbar {
@@ -745,6 +903,7 @@ tbody tr:last-child td {
   .nav-actions {
     width: 100%;
     justify-content: flex-start;
+    flex-wrap: wrap;
   }
 
   .user-name {
@@ -776,6 +935,14 @@ tbody tr:last-child td {
 
   .workspace {
     grid-template-columns: 1fr;
+  }
+
+  .admin-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-create {
+    position: static;
   }
 
   .upload-zone {
@@ -813,6 +980,14 @@ tbody tr:last-child td {
   .nav-actions {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .nav-link {
+    width: 100%;
+  }
+
+  .reset-form {
+    grid-template-columns: 1fr;
   }
 
   .format-option {
