@@ -1,8 +1,8 @@
-# Checkmarx SCA JSON consolidator
+# SCA Stitcher
 
-Python utilities for consolidating native Checkmarx SCA JSON reports into developer-friendly Excel/CSV/HTML output.
+Stitches native Checkmarx SCA JSON reports into developer-friendly Excel/CSV/HTML output, mapping each vulnerable transitive package back to the primary library a developer should actually upgrade.
 
-The repository also includes an authenticated Docker web application for private, ephemeral report processing. Uploads, previews, exports, and report metadata are not persisted.
+The repository also includes an authenticated Docker web application ("SCA Stitcher") for private, ephemeral report processing. Uploads, previews, exports, and report metadata are not persisted.
 
 ## Docker web application
 
@@ -29,11 +29,20 @@ Open <http://localhost:8080> and upload a `.json` or `.zip` report. You can prev
 The HTTP first-account setup route has been removed. Production refuses to start with local password authentication and requires verified AWS ALB OIDC/Cognito identity, secure cookies, a strong secret, and trusted hosts. Review [the production security assessment](docs/security-assessment.md), follow [the AWS production guide](docs/aws-production.md), and start from [the ECS task-definition example](aws/ecs-task-definition.example.json).
 
 Local administrators can manage accounts at `/admin`. Users created or reset there
-must replace their temporary password at the next sign-in. If every administrator
-is locked out, recover an existing local account from the server console:
+must replace their temporary password at the next sign-in.
+
+Reset a forgotten password from the server console:
 
 ```powershell
 flask --app web_app reset-password
+```
+
+If every administrator has lost the admin role, `--grant-admin` restores it on an
+existing account. A plain `reset-password` deliberately does not change roles:
+
+```powershell
+flask --app web_app list-admins
+flask --app web_app reset-password --grant-admin
 ```
 
 Uploads default to a 25 MiB limit, configurable with `MAX_UPLOAD_BYTES`; extracted JSON members inside ZIP uploads are capped to the same limit. Depth, node, package, row, request-rate, and generated-output limits are also configurable in `.env.example`. CLI report parsing defaults to a 100 MiB JSON cap, configurable with `MAX_REPORT_BYTES`.
@@ -84,8 +93,8 @@ python .\checkmarx_sca_consolidator_v2.py `
 The script generates:
 
 ```text
-sca_consolidated\checkmarx_sca_consolidated.xlsx
-sca_consolidated\checkmarx_sca_consolidated.csv
+sca_consolidated\sca_stitcher_consolidated.xlsx
+sca_consolidated\sca_stitcher_consolidated.csv
 sca_consolidated\library_group_summary.csv
 sca_consolidated\unmapped_libraries.csv
 sca_consolidated\consolidated_preview.html

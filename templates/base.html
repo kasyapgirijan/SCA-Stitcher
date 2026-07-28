@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#0f1318">
-  <title>{{ title or 'SCA Report Studio' }}</title>
+  <title>{{ title or 'SCA Stitcher' }}</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
   <script src="{{ url_for('static', filename='app.js') }}" defer></script>
 </head>
@@ -12,9 +12,9 @@
   {% set active_user = current_user() %}
   <header class="app-header">
     <div class="topbar">
-      <a class="brand" href="{{ url_for('index') }}" aria-label="SCA Report Studio home">
+      <a class="brand" href="{{ url_for('index') }}" aria-label="SCA Stitcher home">
         <span class="brand-mark" aria-hidden="true">Cx</span>
-        <span class="brand-name">SCA Report Studio</span>
+        <span class="brand-name">SCA Stitcher</span>
       </a>
       {% if active_user %}
       <div class="nav-actions">

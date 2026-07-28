@@ -73,6 +73,7 @@ class AlbOidcVerifier:
         issuer: str = "",
         key_ttl_seconds: int = 3600,
         key_loader: Callable[[str, str], bytes] | None = None,
+        max_cached_keys: int = 32,
     ) -> None:
         arn_match = ALB_ARN_RE.fullmatch(alb_arn)
         if not arn_match:
@@ -84,6 +85,7 @@ class AlbOidcVerifier:
         self.issuer = issuer
         self.region = arn_match.group(1)
         self.key_ttl_seconds = key_ttl_seconds
+        self.max_cached_keys = max_cached_keys
         self.key_loader = key_loader or self._download_key
         self._keys: dict[str, tuple[bytes, float]] = {}
         self._lock = threading.Lock()
@@ -136,10 +138,19 @@ class AlbOidcVerifier:
             cached = self._keys.get(kid)
             if cached and cached[1] > now:
                 return cached[0]
+            # The kid is attacker-controlled and this runs before the signature is
+            # verified, so cap how many distinct key fetches an unauthenticated
+            # caller can provoke. A real ALB rotates through only a few keys.
+            live = sum(1 for _, expires_at in self._keys.values() if expires_at > now)
+            if live >= self.max_cached_keys:
+                raise AuthenticationError("ALB key cache is saturated.")
+
         key = self.key_loader(self.region, kid)
         if not key or len(key) > 16_384:
             raise AuthenticationError("ALB public key response is invalid.")
+
         with self._lock:
+            self._keys = {k: v for k, v in self._keys.items() if v[1] > now}
             self._keys[kid] = (key, now + self.key_ttl_seconds)
         return key
 
@@ -147,7 +158,7 @@ class AlbOidcVerifier:
     def _download_key(region: str, kid: str) -> bytes:
         request = Request(
             f"https://public-keys.auth.elb.{region}.amazonaws.com/{kid}",
-            headers={"User-Agent": "checkmarx-sca-report-studio/1"},
+            headers={"User-Agent": "checkmarx-sca-stitcher/1"},
         )
         try:
             # Region and key ID are allowlisted before this fixed HTTPS endpoint is built.

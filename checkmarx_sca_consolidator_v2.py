@@ -69,11 +69,23 @@ BUILTIN_GROUP_RULES = [
     {"name": "BIRT", "framework": "BIRT", "patterns": [r"birt"]},
 ]
 
-DEFAULT_MAX_REPORT_BYTES = int(os.environ.get("MAX_REPORT_BYTES", str(100 * 1024 * 1024)))
-DEFAULT_MAX_JSON_DEPTH = int(os.environ.get("MAX_JSON_DEPTH", "64"))
-DEFAULT_MAX_JSON_NODES = int(os.environ.get("MAX_JSON_NODES", "250000"))
-DEFAULT_MAX_PACKAGES = int(os.environ.get("MAX_REPORT_PACKAGES", "100000"))
-DEFAULT_MAX_ROWS = int(os.environ.get("MAX_REPORT_ROWS", "50000"))
+
+def env_int(name: str, default: int) -> int:
+    """Read an integer setting, naming the offending variable when it is malformed."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer (got {raw!r}).") from exc
+
+
+DEFAULT_MAX_REPORT_BYTES = env_int("MAX_REPORT_BYTES", 100 * 1024 * 1024)
+DEFAULT_MAX_JSON_DEPTH = env_int("MAX_JSON_DEPTH", 64)
+DEFAULT_MAX_JSON_NODES = env_int("MAX_JSON_NODES", 250_000)
+DEFAULT_MAX_PACKAGES = env_int("MAX_REPORT_PACKAGES", 100_000)
+DEFAULT_MAX_ROWS = env_int("MAX_REPORT_ROWS", 50_000)
 FORMULA_PREFIXES = frozenset("=+-@\t\r\n＝＋－＠")
 
 OUTPUT_COLUMNS = [
@@ -85,6 +97,18 @@ OUTPUT_COLUMNS = [
 ]
 
 SUMMARY_COLUMNS = ["Library Group", "Framework", "Primary Versions", "Vulnerable Library Count", "Location Count", "Rows"]
+
+# Shared by the CLI and the web exports so both produce identically named files.
+EXPORT_BASENAME = "sca_stitcher_consolidated"
+
+
+class ReportError(ValueError):
+    """Raised when a report cannot be read or exceeds a configured safety limit.
+
+    Deriving from ValueError keeps this catchable by ordinary ``except Exception``
+    handlers; long-running callers such as the web app must never see SystemExit
+    for what is really input validation.
+    """
 
 
 @dataclass
@@ -123,16 +147,16 @@ def validate_json_structure(
     max_nodes: int = DEFAULT_MAX_JSON_NODES,
 ) -> Dict[str, Any]:
     if not isinstance(value, dict):
-        raise ValueError("Report root must be a JSON object.")
+        raise ReportError("Report root must be a JSON object.")
     nodes = 0
     stack: list[tuple[Any, int]] = [(value, 0)]
     while stack:
         current, depth = stack.pop()
         nodes += 1
         if nodes > max_nodes:
-            raise ValueError(f"Report exceeds the structural limit of {max_nodes} JSON nodes.")
+            raise ReportError(f"Report exceeds the structural limit of {max_nodes} JSON nodes.")
         if depth > max_depth:
-            raise ValueError(f"Report exceeds the maximum nesting depth of {max_depth}.")
+            raise ReportError(f"Report exceeds the maximum nesting depth of {max_depth}.")
         if isinstance(current, dict):
             stack.extend((item, depth + 1) for item in current.values() if isinstance(item, (dict, list)))
         elif isinstance(current, list):
@@ -148,7 +172,7 @@ def decode_report(
     try:
         parsed = json.loads(raw.decode("utf-8-sig"))
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
-        raise ValueError("Report is not valid UTF-8 JSON within the supported nesting limit.") from exc
+        raise ReportError("Report is not valid UTF-8 JSON within the supported nesting limit.") from exc
     return validate_json_structure(parsed, max_depth=max_depth, max_nodes=max_nodes)
 
 
@@ -159,31 +183,35 @@ def load_report(
     max_nodes: int = DEFAULT_MAX_JSON_NODES,
 ) -> Dict[str, Any]:
     if not path.exists():
-        raise SystemExit(f"ERROR: input file not found: {path}")
+        raise ReportError(f"Input file not found: {path}")
 
     if path.suffix.lower() == ".zip":
-        with zipfile.ZipFile(path) as zf:
+        try:
+            archive = zipfile.ZipFile(path)
+        except zipfile.BadZipFile as exc:
+            raise ReportError("Upload is not a readable ZIP archive.") from exc
+        with archive as zf:
             json_names = [n for n in zf.namelist() if n.lower().endswith(".json")]
             if not json_names:
-                raise SystemExit("ERROR: ZIP does not contain a JSON report")
+                raise ReportError("ZIP does not contain a JSON report.")
             preferred = sorted(json_names, key=lambda n: ("sca" not in n.lower(), len(n)))[0]
             info = zf.getinfo(preferred)
             if max_json_bytes is not None and info.file_size > max_json_bytes:
-                raise SystemExit(
-                    f"ERROR: JSON report inside ZIP is too large ({info.file_size} bytes; limit {max_json_bytes} bytes)"
+                raise ReportError(
+                    f"JSON report inside ZIP is too large ({info.file_size} bytes; limit {max_json_bytes} bytes)."
                 )
             with zf.open(preferred) as fh:
                 raw = fh.read(-1 if max_json_bytes is None else max_json_bytes + 1)
                 if max_json_bytes is not None and len(raw) > max_json_bytes:
-                    raise SystemExit(f"ERROR: JSON report inside ZIP exceeds the {max_json_bytes}-byte limit")
+                    raise ReportError(f"JSON report inside ZIP exceeds the {max_json_bytes}-byte limit.")
                 return decode_report(raw, max_depth=max_depth, max_nodes=max_nodes)
 
     if max_json_bytes is not None and path.stat().st_size > max_json_bytes:
-        raise SystemExit(f"ERROR: JSON report is too large ({path.stat().st_size} bytes; limit {max_json_bytes} bytes)")
+        raise ReportError(f"JSON report is too large ({path.stat().st_size} bytes; limit {max_json_bytes} bytes).")
     with path.open("rb") as fh:
         raw = fh.read(-1 if max_json_bytes is None else max_json_bytes + 1)
     if max_json_bytes is not None and len(raw) > max_json_bytes:
-        raise SystemExit(f"ERROR: JSON report exceeds the {max_json_bytes}-byte limit")
+        raise ReportError(f"JSON report exceeds the {max_json_bytes}-byte limit.")
     return decode_report(raw, max_depth=max_depth, max_nodes=max_nodes)
 
 
@@ -300,11 +328,24 @@ def normalize_package_paths(raw: Any) -> List[List[PackageRef]]:
     return chains
 
 
+def location_keys(location: str) -> List[str]:
+    """Return a location and each of its ancestor directories, nearest first."""
+    normalized = location.replace("\\", "/").strip().strip("/")
+    if not normalized:
+        return []
+    parts = normalized.split("/")
+    return ["/".join(parts[:index]) for index in range(len(parts), 0, -1)]
+
+
 def build_indexes(packages: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     by_id: Dict[str, Dict[str, Any]] = {}
     by_name_version: Dict[str, Dict[str, Any]] = {}
     by_name: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     direct_packages: List[Dict[str, Any]] = []
+    # Maps a direct package's location, and every ancestor directory of it, to
+    # that package. Lets infer_primary() resolve a location in constant time
+    # instead of comparing every transitive package against every direct one.
+    by_direct_location: Dict[str, Dict[str, Any]] = {}
 
     for pkg in packages:
         ref = PackageRef.from_obj(pkg)
@@ -316,12 +357,16 @@ def build_indexes(packages: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             by_name[ref.name.lower()].append(pkg)
         if is_direct(pkg):
             direct_packages.append(pkg)
+            for raw_location in as_list(pkg.get("Locations")):
+                for key in location_keys(text_or_blank(raw_location)):
+                    by_direct_location.setdefault(key, pkg)
 
     return {
         "by_id": by_id,
         "by_name_version": by_name_version,
         "by_name": by_name,
         "direct_packages": direct_packages,
+        "by_direct_location": by_direct_location,
     }
 
 
@@ -356,12 +401,11 @@ def infer_primary(pkg: Dict[str, Any], chain: List[PackageRef], indexes: Dict[st
             return PackageRef.from_obj(mapped), "first PackagePaths node resolved", not is_direct(mapped)
         return first, "first PackagePaths node inferred", True
 
-    locations = [text_or_blank(x) for x in as_list(pkg.get("Locations"))]
-    for direct in indexes["direct_packages"]:
-        for dloc in as_list(direct.get("Locations")):
-            dloc_s = text_or_blank(dloc)
-            if dloc_s and any(dloc_s in loc or loc in dloc_s for loc in locations if loc):
-                return PackageRef.from_obj(direct), "location prefix matched direct package", False
+    for raw_location in as_list(pkg.get("Locations")):
+        for key in location_keys(text_or_blank(raw_location)):
+            mapped = indexes["by_direct_location"].get(key)
+            if mapped is not None:
+                return PackageRef.from_obj(mapped), "location prefix matched direct package", False
 
     return PackageRef("", "Unmapped Primary Library", ""), "unmapped", True
 
@@ -382,9 +426,9 @@ def recursive_dicts(
         current, depth = stack.pop()
         nodes += 1
         if nodes > max_nodes:
-            raise ValueError(f"Object exceeds the structural limit of {max_nodes} nodes.")
+            raise ReportError(f"Object exceeds the structural limit of {max_nodes} nodes.")
         if depth > max_depth:
-            raise ValueError(f"Object exceeds the maximum nesting depth of {max_depth}.")
+            raise ReportError(f"Object exceeds the maximum nesting depth of {max_depth}.")
         if isinstance(current, dict):
             yield current
             stack.extend((item, depth + 1) for item in current.values() if isinstance(item, (dict, list)))
@@ -435,9 +479,9 @@ def make_rows(
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], Dict[str, Any]]:
     packages = report.get("Packages") or []
     if not isinstance(packages, list):
-        raise SystemExit("ERROR: report does not contain a Packages[] array")
+        raise ReportError("Report does not contain a Packages[] array.")
     if len(packages) > max_packages:
-        raise ValueError(f"Report contains more than the allowed {max_packages} packages.")
+        raise ReportError(f"Report contains more than the allowed {max_packages} packages.")
 
     summary = report.get("RiskReportSummary") or {}
     project = text_or_blank(summary.get("ProjectName")) or text_or_blank(report.get("ProjectName")) or "Unknown Project"
@@ -472,41 +516,56 @@ def make_rows(
         locations = [text_or_blank(x) for x in as_list(pkg.get("Locations"))] or [""]
         vuln_ref = PackageRef.from_obj(pkg)
 
+        # These are constant for the package, so resolve them once rather than
+        # once per generated row. vuln_cell() in particular walks the whole
+        # package dict, which dominated report generation when repeated per row.
+        vuln_display = vuln_cell(pkg)
+        pkg_latest = latest_version(pkg)
+        pkg_is_latest = is_latest(vuln_ref.version, pkg_latest)
+        dependency_type = text_or_blank(pkg.get("DependencyType")) or (
+            "Direct" if is_direct(pkg) else "Transitive"
+        )
+        severity_counts = {
+            "Critical Count": str(as_int(pkg.get("CriticalVulnerabilityCount"))),
+            "High Count": str(as_int(pkg.get("HighVulnerabilityCount"))),
+            "Medium Count": str(as_int(pkg.get("MediumVulnerabilityCount"))),
+            "Low Count": str(as_int(pkg.get("LowVulnerabilityCount"))),
+        }
+
         for chain in chains:
             primary, mapping_source, is_unmapped = infer_primary(pkg, chain, indexes)
             primary_pkg = find_pkg_for_ref(primary, indexes) or {}
+            primary_latest = latest_version(primary_pkg)
             group, framework, group_reason = apply_group_rules(primary, locations, rules)
             path_display = " > ".join(x.display for x in chain) if chain else primary.display
 
             for location in locations:
                 if len(rows) >= max_rows:
-                    raise ValueError(f"Consolidated report exceeds the {max_rows}-row limit.")
+                    raise ReportError(f"Consolidated report exceeds the {max_rows}-row limit.")
                 row = {
                     "Project": project,
                     "Library Group": group,
                     "Framework": framework,
                     "Primary Library": primary.display,
                     "Primary Current Version": primary.version,
-                    "Primary Latest Version": latest_version(primary_pkg),
-                    "Primary Is Latest?": is_latest(primary.version, latest_version(primary_pkg)),
+                    "Primary Latest Version": primary_latest,
+                    "Primary Is Latest?": is_latest(primary.version, primary_latest),
                     "Vulnerable Library": vuln_ref.display,
                     "Vulnerable Current Version": vuln_ref.version,
-                    "Vulnerable Latest Version": latest_version(pkg),
-                    "Vulnerable Is Latest?": is_latest(vuln_ref.version, latest_version(pkg)),
-                    "Dependency Type": text_or_blank(pkg.get("DependencyType")) or ("Direct" if is_direct(pkg) else "Transitive"),
+                    "Vulnerable Latest Version": pkg_latest,
+                    "Vulnerable Is Latest?": pkg_is_latest,
+                    "Dependency Type": dependency_type,
                     "Package Path": path_display,
                     "Location / File Path": location,
-                    "Vulnerability / CVSS Score": vuln_cell(pkg),
+                    "Vulnerability / CVSS Score": vuln_display,
                     "Mapping Source": mapping_source,
                     "Group Reason": group_reason,
-                    "Critical Count": str(as_int(pkg.get("CriticalVulnerabilityCount"))),
-                    "High Count": str(as_int(pkg.get("HighVulnerabilityCount"))),
-                    "Medium Count": str(as_int(pkg.get("MediumVulnerabilityCount"))),
-                    "Low Count": str(as_int(pkg.get("LowVulnerabilityCount"))),
+                    **severity_counts,
                 }
                 rows.append(row)
                 if is_unmapped or primary.name == "Unmapped Primary Library":
-                    unmapped.append(row)
+                    # A copy, so later edits to one view never mutate the other.
+                    unmapped.append(dict(row))
 
     diagnostics["rows_generated"] = len(rows)
     diagnostics["unmapped_rows"] = len(unmapped)
@@ -605,9 +664,10 @@ def write_xlsx_workbook(workbook: Any, sheets: Dict[str, Tuple[List[Dict[str, st
 
 
 def build_xlsx_bytes(sheets: Dict[str, Tuple[List[Dict[str, str]], List[str]]]) -> bytes | None:
+    """Render the workbook in memory, or None when XlsxWriter is not installed."""
     try:
         import xlsxwriter  # type: ignore
-    except Exception:
+    except ImportError:
         return None
 
     output = io.BytesIO()
@@ -618,14 +678,10 @@ def build_xlsx_bytes(sheets: Dict[str, Tuple[List[Dict[str, str]], List[str]]]) 
 
 
 def write_xlsx(path: Path, sheets: Dict[str, Tuple[List[Dict[str, str]], List[str]]]) -> bool:
-    try:
-        import xlsxwriter  # type: ignore
-    except Exception:
+    payload = build_xlsx_bytes(sheets)
+    if payload is None:
         return False
-
-    workbook = xlsxwriter.Workbook(str(path))
-    write_xlsx_workbook(workbook, sheets)
-    workbook.close()
+    path.write_bytes(payload)
     return True
 
 
@@ -641,8 +697,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     rules = compile_rules(Path(args.group_config) if args.group_config else None)
 
-    report = load_report(input_path)
-    rows, unmapped, diagnostics = make_rows(report, rules)
+    try:
+        report = load_report(input_path)
+        rows, unmapped, diagnostics = make_rows(report, rules)
+    except ReportError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     if not rows:
         print("ERROR: No reportable findings remain after filtering. Check severity values and source data.", file=sys.stderr)
         (out_dir / "schema_diagnostics.json").write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
@@ -650,14 +710,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     summary = make_summary(rows)
 
-    write_csv(out_dir / "checkmarx_sca_consolidated.csv", rows, OUTPUT_COLUMNS)
+    write_csv(out_dir / f"{EXPORT_BASENAME}.csv", rows, OUTPUT_COLUMNS)
     write_csv(out_dir / "library_group_summary.csv", summary, SUMMARY_COLUMNS)
     write_csv(out_dir / "unmapped_libraries.csv", unmapped, OUTPUT_COLUMNS)
     write_html(out_dir / "consolidated_preview.html", rows)
     (out_dir / "schema_diagnostics.json").write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
 
     xlsx_written = write_xlsx(
-        out_dir / "checkmarx_sca_consolidated.xlsx",
+        out_dir / f"{EXPORT_BASENAME}.xlsx",
         {
             "Consolidated": (rows, OUTPUT_COLUMNS),
             "Summary": (summary, SUMMARY_COLUMNS),
@@ -668,7 +728,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     print(f"OK: generated {len(rows)} rows in {out_dir}")
     if xlsx_written:
-        print("Excel: checkmarx_sca_consolidated.xlsx")
+        print(f"Excel: {EXPORT_BASENAME}.xlsx")
     else:
         print("Excel skipped: install with 'python -m pip install XlsxWriter'")
     return 0

@@ -1,5 +1,5 @@
 {
-  "family": "checkmarx-sca-report-studio",
+  "family": "checkmarx-sca-stitcher",
   "networkMode": "awsvpc",
   "requiresCompatibilities": [
     "FARGATE"
@@ -16,7 +16,7 @@
   "containerDefinitions": [
     {
       "name": "web",
-      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/checkmarx-sca-report-studio@sha256:IMAGE_DIGEST",
+      "image": "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/checkmarx-sca-stitcher@sha256:IMAGE_DIGEST",
       "essential": true,
       "user": "app",
       "readonlyRootFilesystem": true,
@@ -112,7 +112,7 @@
       "secrets": [
         {
           "name": "SECRET_KEY",
-          "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:checkmarx-sca-report-studio-secret"
+          "valueFrom": "arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:checkmarx-sca-stitcher-secret"
         }
       ],
       "healthCheck": {
@@ -128,7 +128,7 @@
       "logConfiguration": {
         "logDriver": "awslogs",
         "options": {
-          "awslogs-group": "/ecs/checkmarx-sca-report-studio",
+          "awslogs-group": "/ecs/checkmarx-sca-stitcher",
           "awslogs-region": "REGION",
           "awslogs-stream-prefix": "web"
         }

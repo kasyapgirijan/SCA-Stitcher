@@ -18,6 +18,9 @@ set, and the supplied AWS ECS deployment example.
 | Medium | Sessions and browser responses lacked a complete production security profile | Secure host-only cookies, short session lifetime, CSRF checks, no-store caching, CSP, HSTS, frame denial, content sniffing protection, referrer policy, and permissions policy are configured. |
 | Medium | HTML exports could be interpreted as an active same-origin document | HTML is escaped, returned as an attachment, and receives a restrictive sandboxed CSP. |
 | Medium | The image was mutable, privileged, and dependency versions were not reproducible | The base image is digest-pinned, dependencies are hash-locked, the runtime is non-root, setuid/setgid bits are removed, and the ECS example uses a read-only root filesystem with all Linux capabilities dropped. |
+| Critical | Concurrent role changes could remove every administrator, and the documented recovery could not restore the role | The "last administrator" check is evaluated inside the same SQL statement that performs the demotion or delete, so two concurrent requests can no longer both observe a stale count. `reset-password --grant-admin` restores a lost role and `list-admins` reports the current holders. Regression tests exercise both races over repeated trials. |
+| High | Unauthenticated callers could force unbounded ALB signing-key fetches and cache growth | The key ID is attacker-controlled and is resolved before signature verification, so the cache is now capped and expired entries are evicted on write. |
+| Medium | Consolidator defects were reported to users as invalid input and never surfaced | Report parsing raises a dedicated `ReportError` instead of `SystemExit`; the request handler distinguishes rejected input from internal faults, which are logged with a traceback and returned as 500. |
 
 ## Deployment findings
 
@@ -40,7 +43,8 @@ evidence.
 
 ## Verification performed
 
-- `pytest`: 16 passing security and behavior tests.
+- `pytest`: 35 passing security and behavior tests, including repeated-trial
+  concurrency tests for the administrator role and delete guards.
 - `bandit`: no findings in the web app, verifier, or exposed consolidator.
 - `pip-audit`: no known vulnerabilities in the production lock file.
 - Hash-locked production and development dependency installation.
