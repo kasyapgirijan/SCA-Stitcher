@@ -1,10 +1,12 @@
 import io
 import json
+import logging
 import os
 import sqlite3
 import threading
 import time
 import zipfile
+from datetime import timedelta
 from io import BytesIO
 
 import jwt
@@ -15,13 +17,15 @@ from werkzeug.security import generate_password_hash
 
 os.environ.setdefault("SECRET_KEY", "test-import-secret")
 
+import checkmarx_sca_consolidator_v2
 from checkmarx_sca_consolidator_v2 import (
     BUILTIN_GROUP_RULES,
     ReportError,
+    env_int,
     load_report,
     make_rows,
 )
-from security import AlbOidcVerifier, AuthenticationError
+from security import AlbOidcVerifier, AuthenticationError, SlidingWindowLimiter
 from web_app import create_app
 
 
@@ -598,3 +602,394 @@ def test_secret_key_is_required_for_non_test_startup(monkeypatch):
     monkeypatch.delenv("SECRET_KEY", raising=False)
     with pytest.raises(RuntimeError):
         create_app()
+
+
+# --- CSRF and authorization boundaries -------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/report", "/theme", "/logout", "/admin/users", "/admin/users/1/role", "/admin/users/1/delete"],
+)
+def test_state_changing_posts_reject_a_missing_or_wrong_csrf_token(app, client, path):
+    register_and_login(app, client)
+    assert client.post(path, data={}).status_code == 400
+    assert client.post(path, data={"csrf_token": "not-the-session-token"}).status_code == 400
+
+
+ADMIN_MUTATIONS = [
+    "/admin/users",
+    "/admin/users/1/reset-password",
+    "/admin/users/1/role",
+    "/admin/users/1/delete",
+]
+
+
+def signed_in_regular_user(app, client):
+    """Create a non-admin account and return a client signed in as it."""
+    register_and_login(app, client)
+    page = client.get("/admin")
+    client.post(
+        "/admin/users",
+        data={
+            "csrf_token": token(page),
+            "username": "analyst",
+            "password": "temporary-password-2026",
+            "confirm_password": "temporary-password-2026",
+        },
+    )
+    analyst = app.test_client()
+    login_page = analyst.get("/login")
+    analyst.post(
+        "/login",
+        data={
+            "csrf_token": token(login_page),
+            "username": "analyst",
+            "password": "temporary-password-2026",
+        },
+    )
+    change_page = analyst.get("/change-password")
+    analyst.post(
+        "/change-password",
+        data={
+            "csrf_token": token(change_page),
+            "current_password": "temporary-password-2026",
+            "new_password": "analyst-password-2026",
+            "confirm_password": "analyst-password-2026",
+        },
+    )
+    return analyst
+
+
+@pytest.mark.parametrize("path", ADMIN_MUTATIONS)
+def test_admin_mutations_reject_a_non_admin_with_a_valid_csrf_token(app, client, path):
+    analyst = signed_in_regular_user(app, client)
+    csrf = token(analyst.get("/"))
+    assert analyst.post(path, data={"csrf_token": csrf}).status_code == 403
+
+
+@pytest.mark.parametrize("path", ADMIN_MUTATIONS)
+def test_admin_mutations_reject_anonymous_callers(app, client, path):
+    register_and_login(app, client)
+    assert app.test_client().post(path, data={}).status_code == 302
+
+
+# --- Response size bounds ---------------------------------------------------
+
+
+def wide_report(packages=400):
+    return {
+        "RiskReportSummary": {"ProjectName": "Demo"},
+        "Packages": [
+            {
+                "Id": f"pkg-{index}",
+                "Name": "padding" * 30,
+                "Version": "1.0",
+                "IsDirectDependency": True,
+                "HighVulnerabilityCount": 1,
+                "Locations": ["deep/path/" * 20],
+            }
+            for index in range(packages)
+        ],
+    }
+
+
+def test_preview_is_row_bounded_and_says_so(app, client):
+    """The preview renders into one response, so MAX_REPORT_ROWS is not a bound."""
+    app.config["MAX_PREVIEW_ROWS"] = 10
+    register_and_login(app, client)
+    response = post_report(client, client.get("/"), "preview", wide_report(400))
+
+    assert response.status_code == 200
+    assert b"Showing the first 10 of 400 findings" in response.data
+    assert response.data.count(b'class="data-cell') == 10 * 21
+    # The grouped summary is never truncated.
+    assert b"Library groups" in response.data
+
+
+def test_export_byte_cap_rejects_an_oversized_download(app, client):
+    app.config["MAX_EXPORT_BYTES"] = 4096
+    register_and_login(app, client)
+    assert post_report(client, client.get("/"), "csv", wide_report(400)).status_code == 413
+    assert post_report(client, client.get("/"), "xlsx", wide_report(400)).status_code == 413
+
+
+# --- Audit trail ------------------------------------------------------------
+
+
+@pytest.fixture()
+def audit_log(app):
+    records = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    app.logger.addHandler(Capture())
+    app.logger.setLevel(logging.INFO)
+    return records
+
+
+def events(records, name):
+    return [line for line in records if f"security_event={name} " in line]
+
+
+def field(line, key):
+    for part in line.split():
+        if part.startswith(f"{key}="):
+            return part[len(key) + 1 :]
+    return None
+
+
+def test_audit_attributes_privileged_actions_to_the_acting_administrator(app, client, audit_log):
+    register_and_login(app, client)
+    page = client.get("/admin")
+    client.post(
+        "/admin/users",
+        data={
+            "csrf_token": token(page),
+            "username": "analyst",
+            "password": "temporary-password-2026",
+            "confirm_password": "temporary-password-2026",
+            "is_admin": "1",
+        },
+    )
+
+    login = events(audit_log, "login")[-1]
+    created = events(audit_log, "admin_user_create")[-1]
+    actor = field(login, "actor")
+
+    assert actor and actor != "-"
+    # The administrator who performed the change is identified, and is not
+    # confused with the account the change was performed on.
+    assert field(created, "actor") == actor
+    assert field(created, "target") not in (None, "-", actor)
+    # The granted role is recorded, so a promotion is distinguishable from a demotion.
+    assert field(created, "role") == "admin"
+
+
+def test_audit_uses_one_stable_identity_across_event_types(app, client, audit_log):
+    register_and_login(app, client)
+    post_report(client, client.get("/"), "preview")
+
+    login = events(audit_log, "login")[-1]
+    report = events(audit_log, "report_processing")[-1]
+    assert field(login, "actor") == field(report, "actor") != "-"
+
+
+def test_audit_neutralizes_forged_fields_in_attacker_controlled_headers(app, client, audit_log):
+    """X-Amzn-Trace-Id lands in a key=value line, so it must not forge a field."""
+    create_admin(app)
+    page = client.get("/login")
+    client.post(
+        "/login",
+        data={"csrf_token": token(page), "username": "reviewer", "password": "wrong-password"},
+        headers={"X-Amzn-Trace-Id": "Root=1 outcome=succeeded actor=deadbeefdeadbeef"},
+    )
+    line = events(audit_log, "login")[-1]
+
+    assert field(line, "outcome") == "rejected"
+    # The header content survives for troubleshooting, but as a single quoted
+    # token that cannot be read as additional space-delimited pairs.
+    assert "deadbeefdeadbeef" in line
+    assert len([part for part in line.split() if part.startswith("outcome=")]) == 1
+    assert len([part for part in line.split() if part.startswith("actor=")]) == 1
+    assert field(line, "actor") == "-"
+
+
+def test_forwarded_headers_are_ignored_unless_a_proxy_hop_count_is_configured(tmp_path):
+    def remote_for(hops):
+        app = create_app(
+            {
+                "TESTING": True,
+                "APP_ENV": "test",
+                "AUTH_MODE": "local",
+                "SECRET_KEY": "s" * 64,
+                "DATABASE": str(tmp_path / f"hops{hops}.db"),
+                "TRUST_PROXY_HOPS": hops,
+            }
+        )
+        records = []
+
+        class Capture(logging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+
+        app.logger.addHandler(Capture())
+        app.logger.setLevel(logging.INFO)
+        create_admin(app)
+        client = app.test_client()
+        page = client.get("/login")
+        client.post(
+            "/login",
+            data={"csrf_token": token(page), "username": "reviewer", "password": "wrong-password"},
+            headers={"X-Forwarded-For": "203.0.113.9"},
+        )
+        return field(events(records, "login")[-1], "remote")
+
+    assert remote_for(0) == "127.0.0.1"
+    assert remote_for(1) == "203.0.113.9"
+
+
+# --- Resource limits and caches --------------------------------------------
+
+
+def test_rate_limiter_evicts_old_keys_instead_of_locking_out_new_ones():
+    """Limiter keys come from submitted usernames, so a flood must not fail closed."""
+    limiter = SlidingWindowLimiter(max_keys=100)
+    for index in range(500):
+        limiter.check(f"account:attacker{index}", limit=5, window_seconds=300)
+
+    assert limiter.check("account:victim", limit=5, window_seconds=300) == 0
+    assert len(limiter._events) <= 100
+
+
+def test_rate_limiter_still_blocks_a_key_over_its_limit():
+    limiter = SlidingWindowLimiter(max_keys=100)
+    for _ in range(5):
+        assert limiter.check("account:target", limit=5, window_seconds=300) == 0
+    assert limiter.check("account:target", limit=5, window_seconds=300) > 0
+
+
+def public_key_pem():
+    return (
+        ec.generate_private_key(ec.SECP256R1())
+        .public_key()
+        .public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+    )
+
+
+def verifier_with(loader, **kwargs):
+    return AlbOidcVerifier(
+        "arn:aws:elasticloadbalancing:ap-south-1:123456789012:loadbalancer/app/reports/abc123",
+        "client-123",
+        key_loader=loader,
+        **kwargs,
+    )
+
+
+def test_concurrent_requests_for_one_alb_key_share_a_single_fetch():
+    """The kid is attacker-controlled and resolved before signature verification."""
+    pem = public_key_pem()
+    fetched = []
+
+    def slow_loader(_region, kid):
+        fetched.append(kid)
+        time.sleep(0.2)
+        return pem
+
+    verifier = verifier_with(slow_loader)
+    threads = [threading.Thread(target=verifier._get_key, args=("shared-kid",)) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert fetched == ["shared-kid"]
+
+
+def test_alb_key_cache_evicts_rather_than_refusing_new_keys():
+    pem = public_key_pem()
+    verifier = verifier_with(lambda _region, _kid: pem, max_cached_keys=4)
+    for index in range(10):
+        verifier._get_key(f"kid-{index}")
+
+    assert len(verifier._keys) == 4
+    # A saturated cache must not break genuine ALB key rotation.
+    assert verifier._get_key("kid-after-rotation") == pem
+
+
+def test_failed_alb_key_lookups_are_negatively_cached():
+    attempts = []
+
+    def failing_loader(_region, kid):
+        attempts.append(kid)
+        raise AuthenticationError("Could not retrieve the ALB public key.")
+
+    verifier = verifier_with(failing_loader)
+    for _ in range(5):
+        with pytest.raises(AuthenticationError):
+            verifier._get_key("broken-kid")
+
+    assert attempts == ["broken-kid"]
+
+
+def test_package_graph_is_walked_once_per_package(monkeypatch):
+    """extract_vulns() dominates report generation; it must not run three times."""
+    walks = []
+    original = checkmarx_sca_consolidator_v2.recursive_dicts
+
+    def counting(obj, **kwargs):
+        walks.append(1)
+        return original(obj, **kwargs)
+
+    monkeypatch.setattr(checkmarx_sca_consolidator_v2, "recursive_dicts", counting)
+
+    for counts in ({"HighVulnerabilityCount": 1}, {}):
+        walks.clear()
+        report = {
+            "RiskReportSummary": {"ProjectName": "Demo"},
+            "Packages": [
+                {
+                    "Id": f"pkg-{index}",
+                    "Name": f"lib-{index}",
+                    "Version": "1.0",
+                    "IsDirectDependency": True,
+                    "Vulnerabilities": [{"CVE": "CVE-2026-0001", "CVSS": 7.5}],
+                    **counts,
+                }
+                for index in range(50)
+            ],
+        }
+        rows, _, _ = make_rows(report, BUILTIN_GROUP_RULES)
+        assert len(rows) == 50
+        assert len(walks) == 50
+
+
+def test_make_rows_honours_the_configured_structural_limits():
+    report = {
+        "RiskReportSummary": {"ProjectName": "Demo"},
+        "Packages": [
+            {
+                "Id": "pkg",
+                "Name": "lib",
+                "Version": "1.0",
+                "IsDirectDependency": True,
+                "Vulnerabilities": [{"CVE": "CVE-2026-0001", "nest": {"a": {"b": {"c": {}}}}}],
+            }
+        ],
+    }
+    with pytest.raises(ReportError, match="nesting depth"):
+        make_rows(report, BUILTIN_GROUP_RULES, max_depth=2)
+
+
+# --- Configuration ----------------------------------------------------------
+
+
+def test_blank_environment_values_fall_back_to_the_default(monkeypatch):
+    """A blank variable is how operators 'unset' a value; it must not crash startup."""
+    monkeypatch.setenv("MAX_REPORT_ROWS", "")
+    assert env_int("MAX_REPORT_ROWS", 50_000) == 50_000
+    assert env_int("MAX_REPORT_ROWS", 50_000, 1, 250_000) == 50_000
+
+    monkeypatch.setenv("MAX_REPORT_ROWS", "not-a-number")
+    with pytest.raises(RuntimeError, match="must be an integer"):
+        env_int("MAX_REPORT_ROWS", 50_000)
+
+    monkeypatch.setenv("MAX_REPORT_ROWS", "999999999")
+    with pytest.raises(RuntimeError, match="must be between"):
+        env_int("MAX_REPORT_ROWS", 50_000, 1, 250_000)
+
+
+def test_session_lifetime_honours_an_explicit_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("SESSION_LIFETIME_MINUTES", "7")
+    app = create_app(
+        {
+            "TESTING": True,
+            "AUTH_MODE": "local",
+            "SECRET_KEY": "s" * 64,
+            "DATABASE": str(tmp_path / "users.db"),
+            "SESSION_LIFETIME_MINUTES": 600,
+        }
+    )
+    assert app.config["PERMANENT_SESSION_LIFETIME"] == timedelta(minutes=600)

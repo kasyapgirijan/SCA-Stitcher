@@ -7,6 +7,7 @@ import csv
 import hashlib
 import io
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -21,6 +22,7 @@ from urllib.parse import urlparse
 
 import click
 from flask import Flask, Response, abort, flash, g, redirect, render_template, request, session, url_for
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from checkmarx_sca_consolidator_v2 import (
@@ -31,6 +33,7 @@ from checkmarx_sca_consolidator_v2 import (
     ReportError,
     build_html_report,
     build_xlsx_bytes,
+    env_int,
     load_report,
     make_rows,
     make_summary,
@@ -42,22 +45,15 @@ from security import AlbOidcVerifier, AuthenticationError, SlidingWindowLimiter
 THEMES = ("midnight", "light", "blueprint")
 ALLOWED_OUTPUTS = {"preview", "csv", "html", "xlsx"}
 
+# Audit records are emitted as space-separated key=value pairs, so any value that
+# can carry attacker-controlled text is reduced to characters that cannot forge a
+# new field. Header values cannot contain raw newlines, but they can contain
+# spaces and '=' signs, which is enough to fake a second `outcome=` in the line.
+LOG_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._:/=+-]")
 
-def env_int(
-    name: str,
-    default: int,
-    minimum: int,
-    maximum: int,
-    overrides: dict[str, Any] | None = None,
-) -> int:
-    raw = (overrides or {}).get(name, os.environ.get(name, default))
-    try:
-        value = int(raw)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError(f"{name} must be an integer (got {raw!r}).") from exc
-    if not minimum <= value <= maximum:
-        raise RuntimeError(f"{name} must be between {minimum} and {maximum}.")
-    return value
+
+def log_safe(value: str, limit: int = 128) -> str:
+    return LOG_UNSAFE_RE.sub("_", value)[:limit] or "-"
 
 
 def env_bool(name: str, default: bool = False, overrides: dict[str, Any] | None = None) -> bool:
@@ -103,6 +99,7 @@ def export_response(
     unmapped: list[dict[str, str]],
     diagnostics: dict[str, Any],
     max_bytes: int,
+    max_preview_rows: int,
 ) -> Any:
     """Serialize a consolidated report in the requested format."""
     if output_format == "csv":
@@ -142,8 +139,19 @@ def export_response(
             max_bytes,
         )
 
+    # The preview is rendered into a single HTML response, so it needs its own
+    # bound: the byte cap above only applies to the attachment formats, and
+    # MAX_REPORT_ROWS alone would allow a multi-hundred-megabyte page. The
+    # grouped summary is always complete; only the detail table is truncated.
+    visible = rows[:max_preview_rows]
     return render_template(
-        "report.html", rows=rows, summary=summary, diagnostics=diagnostics, unmapped=len(unmapped)
+        "report.html",
+        rows=visible,
+        summary=summary,
+        diagnostics=diagnostics,
+        unmapped=len(unmapped),
+        truncated=len(rows) - len(visible),
+        total_rows=len(rows),
     )
 
 
@@ -167,14 +175,16 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         MAX_JSON_NODES=env_int("MAX_JSON_NODES", 250_000, 1_000, 2_000_000, test_config),
         MAX_REPORT_PACKAGES=env_int("MAX_REPORT_PACKAGES", 100_000, 1, 500_000, test_config),
         MAX_REPORT_ROWS=env_int("MAX_REPORT_ROWS", 50_000, 1, 250_000, test_config),
+        MAX_PREVIEW_ROWS=env_int("MAX_PREVIEW_ROWS", 2_000, 10, 50_000, test_config),
         MAX_EXPORT_BYTES=env_int("MAX_EXPORT_BYTES", 100 * 1024 * 1024, 1024, 250 * 1024 * 1024, test_config),
         REPORTS_PER_MINUTE=env_int("REPORTS_PER_MINUTE", 6, 1, 120, test_config),
+        TRUST_PROXY_HOPS=env_int("TRUST_PROXY_HOPS", 0, 0, 8, test_config),
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
         SESSION_COOKIE_SECURE=cookie_secure,
         SESSION_COOKIE_NAME="__Host-sca_stitcher_session" if app_env == "production" else "sca_stitcher_session",
         PERMANENT_SESSION_LIFETIME=timedelta(
-            minutes=env_int("SESSION_LIFETIME_MINUTES", 30, 5, 12 * 60)
+            minutes=env_int("SESSION_LIFETIME_MINUTES", 30, 5, 12 * 60, test_config)
         ),
         PREFERRED_URL_SCHEME="https" if app_env == "production" else "http",
         TRUSTED_HOSTS=trusted_hosts or None,
@@ -206,6 +216,21 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         validate_https_url(app.config["ALB_ISSUER"], "ALB_ISSUER")
         validate_https_url(app.config["ALB_LOGOUT_URL"], "ALB_LOGOUT_URL")
 
+    # Forwarded headers are honoured only when the operator states how many
+    # proxies sit in front. Trusting them unconditionally would let any client
+    # that can reach the socket directly spoof its own audit address and
+    # rate-limit key, so the default of 0 ignores them entirely.
+    proxy_hops = app.config["TRUST_PROXY_HOPS"]
+    if proxy_hops:
+        app.wsgi_app = ProxyFix(  # type: ignore[method-assign]
+            app.wsgi_app, x_for=proxy_hops, x_proto=proxy_hops, x_host=proxy_hops
+        )
+    elif app.config["APP_ENV"] == "production":
+        app.logger.warning(
+            "security_event=startup outcome=degraded detail=%s",
+            "TRUST_PROXY_HOPS=0_behind_a_load_balancer_records_the_proxy_address_in_audit_events",
+        )
+
     alb_verifier: AlbOidcVerifier | Any | None = app.config.get("ALB_VERIFIER")
     if app.config["AUTH_MODE"] == "alb_oidc" and alb_verifier is None:
         alb_verifier = AlbOidcVerifier(
@@ -224,6 +249,9 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     def db() -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(app.config["DATABASE"], timeout=5)
         connection.row_factory = sqlite3.Row
+        # The image runs multiple gunicorn workers against one database file, so
+        # a blocked writer must wait rather than fail immediately.
+        connection.execute("PRAGMA busy_timeout = 5000")
         try:
             yield connection
             connection.commit()
@@ -239,6 +267,10 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         path = Path(app.config["DATABASE"])
         path.parent.mkdir(parents=True, exist_ok=True)
         with db() as connection:
+            # WAL lets readers proceed during a write, which matters because the
+            # admin pages read the user list while another worker may be
+            # updating a role.
+            connection.execute("PRAGMA journal_mode = WAL")
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS users "
                 "(id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, "
@@ -286,15 +318,34 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     def principal_fingerprint(value: str) -> str:
         return hashlib.sha256(value.lower().encode("utf-8", errors="replace")).hexdigest()[:16]
 
-    def audit(event: str, outcome: str, principal: str = "") -> None:
-        request_id = request.headers.get("X-Amzn-Trace-Id", "")[:128]
+    def current_principal() -> str:
+        """One stable identity per user, shared by every audit event.
+
+        Without this, a login recorded the username while a report recorded the
+        numeric row id, so no two event types could be correlated to the same
+        person.
+        """
+        if app.config["AUTH_MODE"] == "local":
+            return str(session.get("username", "") or getattr(g, "auth_display", ""))
+        return str(getattr(g, "auth_subject", ""))
+
+    def audit(event: str, outcome: str, target: str = "", **extra: str) -> None:
+        """Record a security event.
+
+        ``target`` is the account an action was performed *on*; the actor is
+        always resolved from the request so a privileged change can be traced
+        back to the administrator who made it.
+        """
+        actor = current_principal()
         app.logger.info(
-            "security_event=%s outcome=%s principal=%s remote=%s request_id=%s",
+            'security_event=%s outcome=%s actor=%s target=%s remote=%s request_id="%s"%s',
             event,
             outcome,
-            principal_fingerprint(principal) if principal else "-",
+            principal_fingerprint(actor) if actor else "-",
+            principal_fingerprint(target) if target else "-",
             request.remote_addr or "-",
-            request_id or "-",
+            log_safe(request.headers.get("X-Amzn-Trace-Id", "")),
+            "".join(f" {key}={log_safe(str(value))}" for key, value in extra.items()),
         )
 
     def authenticate_request() -> bool:
@@ -364,6 +415,20 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             if not valid_csrf():
                 abort(400)
             return view(*args, **kwargs)
+
+        return wrapped
+
+    def survives_db_contention(view: Callable[..., Any]) -> Callable[..., Any]:
+        """Turn a lock timeout on a user mutation into a retry prompt, not a 500."""
+
+        @wraps(view)
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return view(*args, **kwargs)
+            except sqlite3.OperationalError:
+                audit(view.__name__, "deferred", reason="database_busy")
+                flash("The user database was busy. Try that change again.")
+                return redirect(url_for("admin"))
 
         return wrapped
 
@@ -449,13 +514,18 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             validate_password(password)
         except ValueError as exc:
             raise click.ClickException(str(exc)) from exc
+        # Two whole statements rather than a concatenated fragment: nothing here
+        # is user-controlled either way, but assembling SQL from a flag is a
+        # pattern worth not having in an auth path at all.
+        statement = (
+            "UPDATE users SET password_hash = ?, must_change_password = 1, is_admin = 1 "
+            "WHERE lower(username) = lower(?)"
+            if grant_admin
+            else "UPDATE users SET password_hash = ?, must_change_password = 1 "
+            "WHERE lower(username) = lower(?)"
+        )
         with db() as connection:
-            result = connection.execute(
-                "UPDATE users SET password_hash = ?, must_change_password = 1"
-                + (", is_admin = 1" if grant_admin else "")
-                + " WHERE lower(username) = lower(?)",
-                (generate_password_hash(password), username),
-            )
+            result = connection.execute(statement, (generate_password_hash(password), username))
             if result.rowcount != 1:
                 raise click.ClickException("No matching local user exists.")
         click.echo("Password reset. The user must choose a new password after signing in.")
@@ -514,7 +584,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
         if not 1 <= len(username) <= 128 or len(password) > 256:
-            audit("login", "rejected", username)
+            audit("login", "rejected", target=username, reason="malformed_credentials")
             flash("Invalid username or password.")
             return render_template("login.html"), 401
 
@@ -526,7 +596,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             ),
         )
         if retry_after:
-            audit("login_rate_limit", "blocked", username)
+            audit("login_rate_limit", "blocked", target=username)
             response = Response(
                 render_template("login.html", rate_limited=True),
                 status=429,
@@ -551,9 +621,9 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 session["theme"] = selected_theme
             session.permanent = True
             login_account_limiter.clear(f"account:{principal_fingerprint(username)}")
-            audit("login", "succeeded", username)
+            audit("login", "succeeded", target=user["username"])
             return redirect(url_for("index"))
-        audit("login", "rejected", username)
+        audit("login", "rejected", target=username, reason="bad_credentials")
         flash("Invalid username or password.")
         return render_template("login.html"), 401
 
@@ -583,7 +653,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                     user and check_password_hash(user["password_hash"], current_password)
                 )
                 if not password_ok:
-                    audit("password_change", "rejected", current_user())
+                    audit("password_change", "rejected", reason="wrong_current_password")
                     flash("The current password is incorrect.")
                     return render_template("change_password.html"), 400
                 if new_password != confirmation:
@@ -610,7 +680,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             if selected_theme in THEMES:
                 session["theme"] = selected_theme
             session.permanent = True
-            audit("password_change", "succeeded", username)
+            audit("password_change", "succeeded")
             flash("Password updated.")
             return redirect(url_for("index"))
         return render_template("change_password.html")
@@ -628,6 +698,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     @app.post("/admin/users")
     @admin_required
     @csrf_protected
+    @survives_db_contention
     def admin_create_user() -> Any:
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
@@ -652,13 +723,19 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         except sqlite3.IntegrityError:
             flash("That username already exists.")
             return redirect(url_for("admin"))
-        audit("admin_user_create", "succeeded", username)
+        audit(
+            "admin_user_create",
+            "succeeded",
+            target=username,
+            role="admin" if is_admin else "user",
+        )
         flash(f"Created {username}. A password change is required at first sign-in.")
         return redirect(url_for("admin"))
 
     @app.post("/admin/users/<int:user_id>/reset-password")
     @admin_required
     @csrf_protected
+    @survives_db_contention
     def admin_reset_password(user_id: int) -> Any:
         password = request.form.get("password", "")
         confirmation = request.form.get("confirm_password", "")
@@ -676,13 +753,14 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 "UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = ?",
                 (generate_password_hash(password), user_id),
             )
-        audit("admin_password_reset", "succeeded", user["username"])
+        audit("admin_password_reset", "succeeded", target=user["username"])
         flash(f"Password reset for {user['username']}. A change is required at next sign-in.")
         return redirect(url_for("admin"))
 
     @app.post("/admin/users/<int:user_id>/role")
     @admin_required
     @csrf_protected
+    @survives_db_contention
     def admin_change_role(user_id: int) -> Any:
         make_admin = request.form.get("is_admin") == "1"
         with db() as connection:
@@ -705,13 +783,19 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 if demoted.rowcount != 1 and user["is_admin"]:
                     flash("At least one administrator must remain.")
                     return redirect(url_for("admin"))
-        audit("admin_role_change", "succeeded", user["username"])
+        audit(
+            "admin_role_change",
+            "succeeded",
+            target=user["username"],
+            new_role="admin" if make_admin else "user",
+        )
         flash(f"Updated the role for {user['username']}.")
         return redirect(url_for("admin"))
 
     @app.post("/admin/users/<int:user_id>/delete")
     @admin_required
     @csrf_protected
+    @survives_db_contention
     def admin_delete_user(user_id: int) -> Any:
         with db() as connection:
             user = require_user(connection, user_id)
@@ -728,7 +812,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             if deleted.rowcount != 1:
                 flash("At least one administrator must remain.")
                 return redirect(url_for("admin"))
-        audit("admin_user_delete", "succeeded", user["username"])
+        audit("admin_user_delete", "succeeded", target=user["username"])
         flash(f"Deleted {user['username']}.")
         return redirect(url_for("admin"))
 
@@ -736,9 +820,10 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     @login_required
     @csrf_protected
     def logout() -> Any:
-        principal = current_user()
+        # g.auth_display survives session.clear(), so audit() still resolves the
+        # actor for the record below.
         session.clear()
-        audit("logout", "succeeded", principal)
+        audit("logout", "succeeded")
         if app.config["AUTH_MODE"] == "local":
             return redirect(url_for("login"))
         if not app.config["ALB_LOGOUT_URL"]:
@@ -753,19 +838,18 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     @login_required
     @csrf_protected
     def report() -> Any:
-        output_format = request.form.get("format") or request.form.get("action") or "preview"
+        output_format = request.form.get("format") or "preview"
         if output_format not in ALLOWED_OUTPUTS:
             flash("Choose a supported output format.")
             return redirect(url_for("index"))
 
-        principal = str(g.auth_subject)
         retry_after = report_limiter.check(
-            f"report:{principal}",
+            f"report:{g.auth_subject}",
             limit=app.config["REPORTS_PER_MINUTE"],
             window_seconds=60,
         )
         if retry_after:
-            audit("report_rate_limit", "blocked", principal)
+            audit("report_rate_limit", "blocked")
             response = Response("Too many report requests. Try again shortly.", status=429, mimetype="text/plain")
             response.headers["Retry-After"] = str(retry_after)
             return response
@@ -779,7 +863,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             flash("Only .json and .zip files are accepted.")
             return redirect(url_for("index"))
         if not report_slot.acquire(blocking=False):
-            audit("report_concurrency", "blocked", principal)
+            audit("report_concurrency", "blocked")
             response = Response(
                 "The report worker is busy. Try again shortly.", status=503, mimetype="text/plain"
             )
@@ -802,32 +886,34 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                         BUILTIN_GROUP_RULES,
                         max_packages=app.config["MAX_REPORT_PACKAGES"],
                         max_rows=app.config["MAX_REPORT_ROWS"],
+                        max_depth=app.config["MAX_JSON_DEPTH"],
+                        max_nodes=app.config["MAX_JSON_NODES"],
                     )
             except (ReportError, OSError, zipfile.BadZipFile) as exc:
-                app.logger.warning(
-                    "security_event=report_processing outcome=rejected principal=%s error_type=%s",
-                    principal_fingerprint(principal),
-                    type(exc).__name__,
-                )
+                audit("report_processing", "rejected", error_type=type(exc).__name__)
                 flash("Could not process the report because it is invalid or exceeds a safety limit.")
                 return redirect(url_for("index"))
-            except Exception:
+            except Exception as exc:
                 # A bug in the consolidator, not bad input. Log the traceback so it
                 # is not silently misreported to the user as an invalid report.
-                app.logger.exception(
-                    "security_event=report_processing outcome=error principal=%s",
-                    principal_fingerprint(principal),
-                )
+                audit("report_processing", "error", error_type=type(exc).__name__)
+                app.logger.exception("Unhandled failure while consolidating a report.")
                 abort(500)
 
             if not rows:
                 flash("No reportable findings were found.")
                 return redirect(url_for("index"))
             summary = make_summary(rows)
-            audit("report_processing", "succeeded", principal)
+            audit("report_processing", "succeeded", output_format=output_format, rows=str(len(rows)))
 
             return export_response(
-                output_format, rows, summary, unmapped, diagnostics, app.config["MAX_EXPORT_BYTES"]
+                output_format,
+                rows,
+                summary,
+                unmapped,
+                diagnostics,
+                app.config["MAX_EXPORT_BYTES"],
+                app.config["MAX_PREVIEW_ROWS"],
             )
         finally:
             report_slot.release()

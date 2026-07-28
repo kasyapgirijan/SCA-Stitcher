@@ -36,6 +36,7 @@ APP_ENV=production
 AUTH_MODE=alb_oidc
 COOKIE_SECURE=true
 TRUSTED_HOSTS=reports.example.com
+TRUST_PROXY_HOPS=1
 ALB_ARN=arn:aws:elasticloadbalancing:REGION:ACCOUNT:loadbalancer/app/NAME/ID
 ALB_CLIENT_ID=the configured Cognito or OIDC client ID
 ALB_ISSUER=https://expected-issuer.example
@@ -44,6 +45,14 @@ ALB_LOGOUT_URL=https://identity-provider.example/logout
 
 Production startup fails closed when the signing secret, secure cookie,
 trusted-host list, or ALB identity configuration is missing.
+
+`TRUST_PROXY_HOPS` is the number of proxies between the client and the task —
+`1` for a single ALB. It defaults to `0`, which ignores `X-Forwarded-*`
+entirely, so audit events would record the ALB's private address instead of the
+client's; production logs a startup warning in that case. Set it no higher than
+the real hop count. Because the target security group admits only the ALB
+(step 4 above), a client cannot reach the socket directly to spoof the header,
+and that security-group rule is what makes trusting it safe.
 
 ## WAF and network controls
 

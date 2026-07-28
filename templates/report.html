@@ -53,8 +53,14 @@
       <h2>Consolidated findings</h2>
       <p>Detailed package paths, versions, vulnerabilities, and severity counts.</p>
     </div>
-    <span class="row-count">{{ rows|length }} findings</span>
+    <span class="row-count">{{ total_rows }} findings</span>
   </div>
+  {% if truncated %}
+  <p class="empty-state" role="status">
+    Showing the first {{ rows|length }} of {{ total_rows }} findings. Download the
+    Excel or CSV export for the complete set.
+  </p>
+  {% endif %}
   {% if rows %}
   <div class="table-scroll table-scroll-large">
     <table>

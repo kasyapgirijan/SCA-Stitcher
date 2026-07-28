@@ -70,15 +70,29 @@ BUILTIN_GROUP_RULES = [
 ]
 
 
-def env_int(name: str, default: int) -> int:
-    """Read an integer setting, naming the offending variable when it is malformed."""
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
+def env_int(
+    name: str,
+    default: int,
+    minimum: int | None = None,
+    maximum: int | None = None,
+    overrides: dict[str, Any] | None = None,
+) -> int:
+    """Read an integer setting, naming the offending variable when it is malformed.
+
+    Shared by the CLI and the web app so a given variable behaves identically in
+    both. A missing or blank value falls back to ``default``; anything else must
+    parse as an integer inside the optional inclusive range.
+    """
+    raw = (overrides or {}).get(name, os.environ.get(name))
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
         return default
     try:
-        return int(raw)
-    except ValueError as exc:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
         raise RuntimeError(f"{name} must be an integer (got {raw!r}).") from exc
+    if (minimum is not None and value < minimum) or (maximum is not None and value > maximum):
+        raise RuntimeError(f"{name} must be between {minimum} and {maximum}.")
+    return value
 
 
 DEFAULT_MAX_REPORT_BYTES = env_int("MAX_REPORT_BYTES", 100 * 1024 * 1024)
@@ -86,7 +100,10 @@ DEFAULT_MAX_JSON_DEPTH = env_int("MAX_JSON_DEPTH", 64)
 DEFAULT_MAX_JSON_NODES = env_int("MAX_JSON_NODES", 250_000)
 DEFAULT_MAX_PACKAGES = env_int("MAX_REPORT_PACKAGES", 100_000)
 DEFAULT_MAX_ROWS = env_int("MAX_REPORT_ROWS", 50_000)
-FORMULA_PREFIXES = frozenset("=+-@\t\r\n＝＋－＠")
+# Leading whitespace is stripped before the prefix test, so only the characters
+# a spreadsheet treats as the start of a formula belong here. The full-width
+# variants are included because Excel normalizes them.
+FORMULA_PREFIXES = frozenset("=+-@＝＋－＠")
 
 OUTPUT_COLUMNS = [
     "Project", "Library Group", "Framework", "Primary Library", "Primary Current Version",
@@ -247,11 +264,17 @@ def vuln_count(pkg: Dict[str, Any]) -> int:
     return sum(as_int(pkg.get(k)) for k in SEVERITY_FIELDS)
 
 
-def is_reportable(pkg: Dict[str, Any]) -> bool:
+def is_reportable(pkg: Dict[str, Any], detailed: Sequence[Tuple[str, str]]) -> bool:
+    """Decide whether a package produces rows.
+
+    ``detailed`` is the already-extracted vulnerability list. It is passed in
+    rather than recomputed because walking the package graph is the single most
+    expensive operation in report generation.
+    """
     severity = text_or_blank(pkg.get("Severity")).upper()
     if severity in SKIP_SEVERITIES:
         return False
-    return vuln_count(pkg) > 0 or bool(extract_vulns(pkg))
+    return vuln_count(pkg) > 0 or bool(detailed)
 
 
 def is_direct(pkg: Dict[str, Any]) -> bool:
@@ -436,10 +459,14 @@ def recursive_dicts(
             stack.extend((item, depth + 1) for item in current if isinstance(item, (dict, list)))
 
 
-def extract_vulns(pkg: Dict[str, Any]) -> List[Tuple[str, str]]:
+def extract_vulns(
+    pkg: Dict[str, Any],
+    max_depth: int = DEFAULT_MAX_JSON_DEPTH,
+    max_nodes: int = DEFAULT_MAX_JSON_NODES,
+) -> List[Tuple[str, str]]:
     vulns: List[Tuple[str, str]] = []
     seen = set()
-    for d in recursive_dicts(pkg):
+    for d in recursive_dicts(pkg, max_depth=max_depth, max_nodes=max_nodes):
         vuln_id = ""
         for key in ID_KEYS:
             value = text_or_blank(d.get(key))
@@ -461,10 +488,9 @@ def extract_vulns(pkg: Dict[str, Any]) -> List[Tuple[str, str]]:
     return vulns
 
 
-def vuln_cell(pkg: Dict[str, Any]) -> str:
-    vulns = extract_vulns(pkg)
-    if vulns:
-        return "\n".join(f"{vid} | CVSS {score}" if score else vid for vid, score in vulns)
+def vuln_cell(pkg: Dict[str, Any], detailed: Sequence[Tuple[str, str]]) -> str:
+    if detailed:
+        return "\n".join(f"{vid} | CVSS {score}" if score else vid for vid, score in detailed)
     counts = {k.replace("VulnerabilityCount", ""): as_int(pkg.get(k)) for k in SEVERITY_FIELDS if as_int(pkg.get(k))}
     if counts:
         return "Vulnerability details not itemized in source; counts: " + ", ".join(f"{k}={v}" for k, v in counts.items())
@@ -476,6 +502,8 @@ def make_rows(
     rules: Sequence[Dict[str, Any]],
     max_packages: int = DEFAULT_MAX_PACKAGES,
     max_rows: int = DEFAULT_MAX_ROWS,
+    max_depth: int = DEFAULT_MAX_JSON_DEPTH,
+    max_nodes: int = DEFAULT_MAX_JSON_NODES,
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], Dict[str, Any]]:
     packages = report.get("Packages") or []
     if not isinstance(packages, list):
@@ -501,10 +529,13 @@ def make_rows(
     }
 
     for pkg in packages:
-        if not is_reportable(pkg):
+        # The single traversal of this package's object graph. is_reportable()
+        # and vuln_cell() both need it, and it previously ran two or three times
+        # per package, which dominated report generation on large uploads.
+        detailed = extract_vulns(pkg, max_depth=max_depth, max_nodes=max_nodes)
+        if not is_reportable(pkg, detailed):
             continue
         diagnostics["reportable_packages"] += 1
-        detailed = extract_vulns(pkg)
         if detailed:
             diagnostics["detailed_vulnerabilities_found"] += len(detailed)
         else:
@@ -517,9 +548,8 @@ def make_rows(
         vuln_ref = PackageRef.from_obj(pkg)
 
         # These are constant for the package, so resolve them once rather than
-        # once per generated row. vuln_cell() in particular walks the whole
-        # package dict, which dominated report generation when repeated per row.
-        vuln_display = vuln_cell(pkg)
+        # once per generated row.
+        vuln_display = vuln_cell(pkg, detailed)
         pkg_latest = latest_version(pkg)
         pkg_is_latest = is_latest(vuln_ref.version, pkg_latest)
         dependency_type = text_or_blank(pkg.get("DependencyType")) or (
