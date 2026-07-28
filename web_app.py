@@ -10,10 +10,12 @@ import os
 import secrets
 import sqlite3
 import threading
+import zipfile
 from contextlib import contextmanager
 from datetime import timedelta
 from functools import wraps
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Callable, Iterator
 from urllib.parse import urlparse
 
@@ -23,8 +25,10 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 from checkmarx_sca_consolidator_v2 import (
     BUILTIN_GROUP_RULES,
+    EXPORT_BASENAME,
     OUTPUT_COLUMNS,
     SUMMARY_COLUMNS,
+    ReportError,
     build_html_report,
     build_xlsx_bytes,
     load_report,
@@ -39,20 +43,30 @@ THEMES = ("midnight", "light", "blueprint")
 ALLOWED_OUTPUTS = {"preview", "csv", "html", "xlsx"}
 
 
-def env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+def env_int(
+    name: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+    overrides: dict[str, Any] | None = None,
+) -> int:
+    raw = (overrides or {}).get(name, os.environ.get(name, default))
     try:
-        value = int(os.environ.get(name, str(default)))
-    except ValueError as exc:
-        raise RuntimeError(f"{name} must be an integer.") from exc
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{name} must be an integer (got {raw!r}).") from exc
     if not minimum <= value <= maximum:
         raise RuntimeError(f"{name} must be between {minimum} and {maximum}.")
     return value
 
 
-def env_bool(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name, str(default)).strip().lower()
+def env_bool(name: str, default: bool = False, overrides: dict[str, Any] | None = None) -> bool:
+    raw = (overrides or {}).get(name, os.environ.get(name, default))
+    if isinstance(raw, bool):
+        return raw
+    value = str(raw).strip().lower()
     if value not in {"true", "false"}:
-        raise RuntimeError(f"{name} must be true or false.")
+        raise RuntimeError(f"{name} must be true or false (got {raw!r}).")
     return value == "true"
 
 
@@ -64,33 +78,101 @@ def validate_https_url(value: str, setting: str) -> None:
         raise RuntimeError(f"{setting} must be an absolute HTTPS URL.")
 
 
+def csv_payload(rows: list[dict[str, str]]) -> bytes:
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=OUTPUT_COLUMNS, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows({key: spreadsheet_safe(value) for key, value in row.items()} for row in rows)
+    return ("﻿" + output.getvalue()).encode("utf-8")
+
+
+def attachment(payload: bytes, mimetype: str, filename: str, max_bytes: int, **headers: str) -> Response:
+    if len(payload) > max_bytes:
+        abort(413)
+    return Response(
+        payload,
+        mimetype=mimetype,
+        headers={"Content-Disposition": f"attachment; filename={filename}", **headers},
+    )
+
+
+def export_response(
+    output_format: str,
+    rows: list[dict[str, str]],
+    summary: list[dict[str, str]],
+    unmapped: list[dict[str, str]],
+    diagnostics: dict[str, Any],
+    max_bytes: int,
+) -> Any:
+    """Serialize a consolidated report in the requested format."""
+    if output_format == "csv":
+        return attachment(csv_payload(rows), "text/csv", f"{EXPORT_BASENAME}.csv", max_bytes)
+
+    if output_format == "html":
+        return attachment(
+            build_html_report(rows).encode("utf-8"),
+            "text/html",
+            f"{EXPORT_BASENAME}.html",
+            max_bytes,
+            **{
+                "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; "
+                "base-uri 'none'; form-action 'none'; sandbox"
+            },
+        )
+
+    if output_format == "xlsx":
+        payload = build_xlsx_bytes(
+            {
+                "Consolidated": (rows, OUTPUT_COLUMNS),
+                "Summary": (summary, SUMMARY_COLUMNS),
+                "Unmapped": (unmapped, OUTPUT_COLUMNS),
+                "Diagnostics": (
+                    [{key: str(value) for key, value in diagnostics.items()}],
+                    list(diagnostics.keys()),
+                ),
+            }
+        )
+        if payload is None:
+            flash("Excel export is not available because XlsxWriter is not installed.")
+            return redirect(url_for("index"))
+        return attachment(
+            payload,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            f"{EXPORT_BASENAME}.xlsx",
+            max_bytes,
+        )
+
+    return render_template(
+        "report.html", rows=rows, summary=summary, diagnostics=diagnostics, unmapped=len(unmapped)
+    )
+
+
 def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     test_config = test_config or {}
     app = Flask(__name__)
     app_env = str(test_config.get("APP_ENV", os.environ.get("APP_ENV", "development"))).lower()
     auth_mode = str(test_config.get("AUTH_MODE", os.environ.get("AUTH_MODE", "local"))).lower()
-    configured_secret = os.environ.get("SECRET_KEY") or test_config.get("SECRET_KEY")
-    cookie_secure = env_bool("COOKIE_SECURE", False)
+    cookie_secure = env_bool("COOKIE_SECURE", False, test_config)
     trusted_hosts = [host.strip() for host in os.environ.get("TRUSTED_HOSTS", "").split(",") if host.strip()]
 
     app.config.update(
         APP_ENV=app_env,
         AUTH_MODE=auth_mode,
-        SECRET_KEY=configured_secret,
+        SECRET_KEY=os.environ.get("SECRET_KEY"),
         DATABASE=os.environ.get("DATABASE_PATH", "/data/users.db"),
-        MAX_CONTENT_LENGTH=env_int("MAX_UPLOAD_BYTES", 25 * 1024 * 1024, 1024, 100 * 1024 * 1024),
+        MAX_CONTENT_LENGTH=env_int("MAX_UPLOAD_BYTES", 25 * 1024 * 1024, 1024, 100 * 1024 * 1024, test_config),
         MAX_FORM_MEMORY_SIZE=512 * 1024,
         MAX_FORM_PARTS=20,
-        MAX_JSON_DEPTH=env_int("MAX_JSON_DEPTH", 64, 8, 256),
-        MAX_JSON_NODES=env_int("MAX_JSON_NODES", 250_000, 1_000, 2_000_000),
-        MAX_REPORT_PACKAGES=env_int("MAX_REPORT_PACKAGES", 100_000, 1, 500_000),
-        MAX_REPORT_ROWS=env_int("MAX_REPORT_ROWS", 50_000, 1, 250_000),
-        MAX_EXPORT_BYTES=env_int("MAX_EXPORT_BYTES", 100 * 1024 * 1024, 1024, 250 * 1024 * 1024),
-        REPORTS_PER_MINUTE=env_int("REPORTS_PER_MINUTE", 6, 1, 120),
+        MAX_JSON_DEPTH=env_int("MAX_JSON_DEPTH", 64, 8, 256, test_config),
+        MAX_JSON_NODES=env_int("MAX_JSON_NODES", 250_000, 1_000, 2_000_000, test_config),
+        MAX_REPORT_PACKAGES=env_int("MAX_REPORT_PACKAGES", 100_000, 1, 500_000, test_config),
+        MAX_REPORT_ROWS=env_int("MAX_REPORT_ROWS", 50_000, 1, 250_000, test_config),
+        MAX_EXPORT_BYTES=env_int("MAX_EXPORT_BYTES", 100 * 1024 * 1024, 1024, 250 * 1024 * 1024, test_config),
+        REPORTS_PER_MINUTE=env_int("REPORTS_PER_MINUTE", 6, 1, 120, test_config),
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
         SESSION_COOKIE_SECURE=cookie_secure,
-        SESSION_COOKIE_NAME="__Host-checkmarkx_session" if app_env == "production" else "checkmarkx_session",
+        SESSION_COOKIE_NAME="__Host-sca_stitcher_session" if app_env == "production" else "sca_stitcher_session",
         PERMANENT_SESSION_LIFETIME=timedelta(
             minutes=env_int("SESSION_LIFETIME_MINUTES", 30, 5, 12 * 60)
         ),
@@ -140,11 +222,23 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
 
     @contextmanager
     def db() -> Iterator[sqlite3.Connection]:
-        path = Path(app.config["DATABASE"])
-        path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(path, timeout=5)
+        connection = sqlite3.connect(app.config["DATABASE"], timeout=5)
         connection.row_factory = sqlite3.Row
         try:
+            yield connection
+            connection.commit()
+        finally:
+            connection.close()
+
+    def init_db() -> None:
+        """Create and migrate the schema once at startup.
+
+        This deliberately does not run per request: issuing DDL from concurrent
+        request threads is both wasteful and unsafe.
+        """
+        path = Path(app.config["DATABASE"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with db() as connection:
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS users "
                 "(id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, "
@@ -166,10 +260,9 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 "CREATE UNIQUE INDEX IF NOT EXISTS users_username_nocase "
                 "ON users(lower(username))"
             )
-            yield connection
-            connection.commit()
-        finally:
-            connection.close()
+
+    if app.config["AUTH_MODE"] == "local":
+        init_db()
 
     def csrf_token() -> str:
         return session.setdefault("csrf_token", secrets.token_urlsafe(32))
@@ -178,11 +271,17 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         expected = session.get("csrf_token", "")
         return bool(expected and secrets.compare_digest(expected, request.form.get("csrf_token", "")))
 
-    def validate_local_credentials(username: str, password: str) -> None:
+    def validate_username(username: str) -> None:
         if not 3 <= len(username) <= 128:
             raise ValueError("Username must contain 3-128 characters.")
+
+    def validate_password(password: str) -> None:
         if not 12 <= len(password) <= 256:
             raise ValueError("Password must contain 12-256 characters.")
+
+    def validate_local_credentials(username: str, password: str) -> None:
+        validate_username(username)
+        validate_password(password)
 
     def principal_fingerprint(value: str) -> str:
         return hashlib.sha256(value.lower().encode("utf-8", errors="replace")).hexdigest()[:16]
@@ -259,6 +358,24 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
 
         return wrapped
 
+    def csrf_protected(view: Callable[..., Any]) -> Callable[..., Any]:
+        @wraps(view)
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            if not valid_csrf():
+                abort(400)
+            return view(*args, **kwargs)
+
+        return wrapped
+
+    def require_user(connection: sqlite3.Connection, user_id: int) -> sqlite3.Row:
+        user = connection.execute(
+            "SELECT id, username, is_admin, must_change_password FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+        if not user:
+            abort(404)
+        return user
+
     def current_user() -> str:
         return str(getattr(g, "auth_display", "") or session.get("username", ""))
 
@@ -318,24 +435,48 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     @app.cli.command("reset-password")
     @click.option("--username", prompt=True)
     @click.option("--password", prompt=True, hide_input=True, confirmation_prompt=True)
-    def reset_password(username: str, password: str) -> None:
+    @click.option(
+        "--grant-admin",
+        is_flag=True,
+        help="Also restore administrator access, for recovering from a full lockout.",
+    )
+    def reset_password(username: str, password: str, grant_admin: bool) -> None:
         """Reset a local password and require the user to replace it after signing in."""
         if app.config["AUTH_MODE"] != "local":
             raise click.ClickException("Local users are disabled when AUTH_MODE is not local.")
         username = username.strip()
         try:
-            validate_local_credentials(username, password)
+            validate_password(password)
         except ValueError as exc:
             raise click.ClickException(str(exc)) from exc
         with db() as connection:
             result = connection.execute(
-                "UPDATE users SET password_hash = ?, must_change_password = 1 "
-                "WHERE lower(username) = lower(?)",
+                "UPDATE users SET password_hash = ?, must_change_password = 1"
+                + (", is_admin = 1" if grant_admin else "")
+                + " WHERE lower(username) = lower(?)",
                 (generate_password_hash(password), username),
             )
             if result.rowcount != 1:
                 raise click.ClickException("No matching local user exists.")
         click.echo("Password reset. The user must choose a new password after signing in.")
+        if grant_admin:
+            click.echo("Administrator access restored.")
+
+    @app.cli.command("list-admins")
+    def list_admins() -> None:
+        """Show which local accounts currently hold administrator access."""
+        if app.config["AUTH_MODE"] != "local":
+            raise click.ClickException("Local users are disabled when AUTH_MODE is not local.")
+        with db() as connection:
+            admins = connection.execute(
+                "SELECT username FROM users WHERE is_admin = 1 ORDER BY lower(username)"
+            ).fetchall()
+        if not admins:
+            click.echo("No administrators exist. Recover one with:")
+            click.echo("  flask --app web_app reset-password --grant-admin")
+            return
+        for row in admins:
+            click.echo(row["username"])
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -348,12 +489,13 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
 
     @app.post("/theme")
     @login_required
+    @csrf_protected
     def theme() -> Any:
-        if not valid_csrf():
-            abort(400)
         selected = request.form.get("theme", "")
-        if selected in THEMES:
-            session["theme"] = selected
+        if selected not in THEMES:
+            flash("That theme is not available.")
+            return redirect(url_for("index"))
+        session["theme"] = selected
         return redirect(url_for("index"))
 
     @app.route("/login", methods=["GET", "POST"])
@@ -361,52 +503,59 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         if app.config["AUTH_MODE"] != "local":
             return redirect(url_for("index"))
         with db() as connection:
-            if not connection.execute("SELECT 1 FROM users LIMIT 1").fetchone():
-                return render_template("login.html", needs_admin=True), 503
-            if request.method == "POST":
-                if not valid_csrf():
-                    abort(400)
-                username = request.form.get("username", "").strip()
-                password = request.form.get("password", "")
-                if not 1 <= len(username) <= 128 or len(password) > 256:
-                    audit("login", "rejected", username)
-                    flash("Invalid username or password.")
-                    return render_template("login.html"), 401
+            provisioned = connection.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None
+        if not provisioned:
+            return render_template("login.html", needs_admin=True), 503
+        if request.method != "POST":
+            return render_template("login.html")
 
-                remote = request.remote_addr or "unknown"
-                retry_after = max(
-                    login_ip_limiter.check(f"ip:{remote}", limit=10, window_seconds=300),
-                    login_account_limiter.check(
-                        f"account:{principal_fingerprint(username)}", limit=5, window_seconds=300
-                    ),
-                )
-                if retry_after:
-                    audit("login_rate_limit", "blocked", username)
-                    response = Response(
-                        render_template("login.html", rate_limited=True),
-                        status=429,
-                        mimetype="text/html",
-                    )
-                    response.headers["Retry-After"] = str(retry_after)
-                    return response
+        if not valid_csrf():
+            abort(400)
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        if not 1 <= len(username) <= 128 or len(password) > 256:
+            audit("login", "rejected", username)
+            flash("Invalid username or password.")
+            return render_template("login.html"), 401
 
-                user = connection.execute(
-                    "SELECT id, username, password_hash FROM users WHERE lower(username) = lower(?)",
-                    (username,),
-                ).fetchone()
-                password_ok = check_password_hash(user["password_hash"] if user else dummy_password_hash, password)
-                if user and password_ok:
-                    session.clear()
-                    session["user_id"] = user["id"]
-                    session["username"] = user["username"]
-                    session.permanent = True
-                    login_account_limiter.clear(f"account:{principal_fingerprint(username)}")
-                    audit("login", "succeeded", username)
-                    return redirect(url_for("index"))
-                audit("login", "rejected", username)
-                flash("Invalid username or password.")
-                return render_template("login.html"), 401
-        return render_template("login.html")
+        remote = request.remote_addr or "unknown"
+        retry_after = max(
+            login_ip_limiter.check(f"ip:{remote}", limit=10, window_seconds=300),
+            login_account_limiter.check(
+                f"account:{principal_fingerprint(username)}", limit=5, window_seconds=300
+            ),
+        )
+        if retry_after:
+            audit("login_rate_limit", "blocked", username)
+            response = Response(
+                render_template("login.html", rate_limited=True),
+                status=429,
+                mimetype="text/html",
+            )
+            response.headers["Retry-After"] = str(retry_after)
+            return response
+
+        # The connection is released before hashing, which is deliberately slow.
+        with db() as connection:
+            user = connection.execute(
+                "SELECT id, username, password_hash FROM users WHERE lower(username) = lower(?)",
+                (username,),
+            ).fetchone()
+        password_ok = check_password_hash(user["password_hash"] if user else dummy_password_hash, password)
+        if user and password_ok:
+            selected_theme = session.get("theme")
+            session.clear()
+            session["user_id"] = user["id"]
+            session["username"] = user["username"]
+            if selected_theme in THEMES:
+                session["theme"] = selected_theme
+            session.permanent = True
+            login_account_limiter.clear(f"account:{principal_fingerprint(username)}")
+            audit("login", "succeeded", username)
+            return redirect(url_for("index"))
+        audit("login", "rejected", username)
+        flash("Invalid username or password.")
+        return render_template("login.html"), 401
 
     @app.get("/recovery")
     def recovery() -> Any:
@@ -441,7 +590,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                     flash("The new passwords do not match.")
                     return render_template("change_password.html"), 400
                 try:
-                    validate_local_credentials(user["username"], new_password)
+                    validate_password(new_password)
                 except ValueError as exc:
                     flash(str(exc))
                     return render_template("change_password.html"), 400
@@ -478,9 +627,8 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
 
     @app.post("/admin/users")
     @admin_required
+    @csrf_protected
     def admin_create_user() -> Any:
-        if not valid_csrf():
-            abort(400)
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
         confirmation = request.form.get("confirm_password", "")
@@ -510,25 +658,20 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
 
     @app.post("/admin/users/<int:user_id>/reset-password")
     @admin_required
+    @csrf_protected
     def admin_reset_password(user_id: int) -> Any:
-        if not valid_csrf():
-            abort(400)
         password = request.form.get("password", "")
         confirmation = request.form.get("confirm_password", "")
         if password != confirmation:
             flash("The temporary passwords do not match.")
             return redirect(url_for("admin"))
+        try:
+            validate_password(password)
+        except ValueError as exc:
+            flash(str(exc))
+            return redirect(url_for("admin"))
         with db() as connection:
-            user = connection.execute(
-                "SELECT id, username FROM users WHERE id = ?", (user_id,)
-            ).fetchone()
-            if not user:
-                abort(404)
-            try:
-                validate_local_credentials(user["username"], password)
-            except ValueError as exc:
-                flash(str(exc))
-                return redirect(url_for("admin"))
+            user = require_user(connection, user_id)
             connection.execute(
                 "UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = ?",
                 (generate_password_hash(password), user_id),
@@ -539,65 +682,60 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
 
     @app.post("/admin/users/<int:user_id>/role")
     @admin_required
+    @csrf_protected
     def admin_change_role(user_id: int) -> Any:
-        if not valid_csrf():
-            abort(400)
         make_admin = request.form.get("is_admin") == "1"
         with db() as connection:
-            user = connection.execute(
-                "SELECT id, username, is_admin FROM users WHERE id = ?", (user_id,)
-            ).fetchone()
-            if not user:
-                abort(404)
+            user = require_user(connection, user_id)
             if user_id == int(session["user_id"]) and not make_admin:
                 flash("You cannot remove your own administrator access.")
                 return redirect(url_for("admin"))
-            if user["is_admin"] and not make_admin:
-                admin_count = connection.execute(
-                    "SELECT count(*) FROM users WHERE is_admin = 1"
-                ).fetchone()[0]
-                if admin_count <= 1:
+            if make_admin:
+                connection.execute("UPDATE users SET is_admin = 1 WHERE id = ?", (user_id,))
+            else:
+                # The remaining-admin count is evaluated inside the same statement
+                # so two concurrent demotions cannot both observe a stale count and
+                # leave the deployment with no administrator at all.
+                demoted = connection.execute(
+                    "UPDATE users SET is_admin = 0 "
+                    "WHERE id = ? AND is_admin = 1 "
+                    "  AND (SELECT count(*) FROM users WHERE is_admin = 1) > 1",
+                    (user_id,),
+                )
+                if demoted.rowcount != 1 and user["is_admin"]:
                     flash("At least one administrator must remain.")
                     return redirect(url_for("admin"))
-            connection.execute(
-                "UPDATE users SET is_admin = ? WHERE id = ?",
-                (1 if make_admin else 0, user_id),
-            )
         audit("admin_role_change", "succeeded", user["username"])
         flash(f"Updated the role for {user['username']}.")
         return redirect(url_for("admin"))
 
     @app.post("/admin/users/<int:user_id>/delete")
     @admin_required
+    @csrf_protected
     def admin_delete_user(user_id: int) -> Any:
-        if not valid_csrf():
-            abort(400)
         with db() as connection:
-            user = connection.execute(
-                "SELECT id, username, is_admin FROM users WHERE id = ?", (user_id,)
-            ).fetchone()
-            if not user:
-                abort(404)
+            user = require_user(connection, user_id)
             if user_id == int(session["user_id"]):
                 flash("You cannot delete your own signed-in account.")
                 return redirect(url_for("admin"))
-            if user["is_admin"]:
-                admin_count = connection.execute(
-                    "SELECT count(*) FROM users WHERE is_admin = 1"
-                ).fetchone()[0]
-                if admin_count <= 1:
-                    flash("At least one administrator must remain.")
-                    return redirect(url_for("admin"))
-            connection.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            # Same single-statement guard as the demotion path above.
+            deleted = connection.execute(
+                "DELETE FROM users "
+                "WHERE id = ? "
+                "  AND (is_admin = 0 OR (SELECT count(*) FROM users WHERE is_admin = 1) > 1)",
+                (user_id,),
+            )
+            if deleted.rowcount != 1:
+                flash("At least one administrator must remain.")
+                return redirect(url_for("admin"))
         audit("admin_user_delete", "succeeded", user["username"])
         flash(f"Deleted {user['username']}.")
         return redirect(url_for("admin"))
 
     @app.post("/logout")
     @login_required
+    @csrf_protected
     def logout() -> Any:
-        if not valid_csrf():
-            abort(400)
         principal = current_user()
         session.clear()
         audit("logout", "succeeded", principal)
@@ -613,9 +751,8 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
 
     @app.post("/report")
     @login_required
+    @csrf_protected
     def report() -> Any:
-        if not valid_csrf():
-            abort(400)
         output_format = request.form.get("format") or request.form.get("action") or "preview"
         if output_format not in ALLOWED_OUTPUTS:
             flash("Choose a supported output format.")
@@ -643,9 +780,11 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             return redirect(url_for("index"))
         if not report_slot.acquire(blocking=False):
             audit("report_concurrency", "blocked", principal)
-            abort(503)
-
-        from tempfile import TemporaryDirectory
+            response = Response(
+                "The report worker is busy. Try again shortly.", status=503, mimetype="text/plain"
+            )
+            response.headers["Retry-After"] = "30"
+            return response
 
         try:
             try:
@@ -664,7 +803,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                         max_packages=app.config["MAX_REPORT_PACKAGES"],
                         max_rows=app.config["MAX_REPORT_ROWS"],
                     )
-            except (ValueError, OSError, KeyError, TypeError, AttributeError, sqlite3.Error, SystemExit) as exc:
+            except (ReportError, OSError, zipfile.BadZipFile) as exc:
                 app.logger.warning(
                     "security_event=report_processing outcome=rejected principal=%s error_type=%s",
                     principal_fingerprint(principal),
@@ -672,6 +811,14 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 )
                 flash("Could not process the report because it is invalid or exceeds a safety limit.")
                 return redirect(url_for("index"))
+            except Exception:
+                # A bug in the consolidator, not bad input. Log the traceback so it
+                # is not silently misreported to the user as an invalid report.
+                app.logger.exception(
+                    "security_event=report_processing outcome=error principal=%s",
+                    principal_fingerprint(principal),
+                )
+                abort(500)
 
             if not rows:
                 flash("No reportable findings were found.")
@@ -679,63 +826,8 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             summary = make_summary(rows)
             audit("report_processing", "succeeded", principal)
 
-            if output_format == "csv":
-                output = io.StringIO()
-                writer = csv.DictWriter(output, fieldnames=OUTPUT_COLUMNS, extrasaction="ignore")
-                writer.writeheader()
-                writer.writerows(
-                    {key: spreadsheet_safe(value) for key, value in row.items()}
-                    for row in rows
-                )
-                payload = ("\ufeff" + output.getvalue()).encode("utf-8")
-                if len(payload) > app.config["MAX_EXPORT_BYTES"]:
-                    abort(413)
-                return Response(
-                    payload,
-                    mimetype="text/csv",
-                    headers={"Content-Disposition": "attachment; filename=checkmarx_sca_consolidated.csv"},
-                )
-            if output_format == "html":
-                payload = build_html_report(rows).encode("utf-8")
-                if len(payload) > app.config["MAX_EXPORT_BYTES"]:
-                    abort(413)
-                return Response(
-                    payload,
-                    mimetype="text/html",
-                    headers={
-                        "Content-Disposition": "attachment; filename=checkmarx_sca_consolidated.html",
-                        "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; "
-                        "base-uri 'none'; form-action 'none'; sandbox",
-                    },
-                )
-            if output_format == "xlsx":
-                payload = build_xlsx_bytes(
-                    {
-                        "Consolidated": (rows, OUTPUT_COLUMNS),
-                        "Summary": (summary, SUMMARY_COLUMNS),
-                        "Unmapped": (unmapped, OUTPUT_COLUMNS),
-                        "Diagnostics": (
-                            [{key: str(value) for key, value in diagnostics.items()}],
-                            list(diagnostics.keys()),
-                        ),
-                    }
-                )
-                if payload is None:
-                    flash("Excel export is not available because XlsxWriter is not installed.")
-                    return redirect(url_for("index"))
-                if len(payload) > app.config["MAX_EXPORT_BYTES"]:
-                    abort(413)
-                return Response(
-                    payload,
-                    mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    headers={"Content-Disposition": "attachment; filename=checkmarx_sca_consolidated.xlsx"},
-                )
-            return render_template(
-                "report.html",
-                rows=rows,
-                summary=summary,
-                diagnostics=diagnostics,
-                unmapped=len(unmapped),
+            return export_response(
+                output_format, rows, summary, unmapped, diagnostics, app.config["MAX_EXPORT_BYTES"]
             )
         finally:
             report_slot.release()
@@ -743,8 +835,18 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
     return app
 
 
-app = create_app()
+def __getattr__(name: str) -> Any:
+    """Build the WSGI app lazily so importing this module never validates config.
+
+    ``gunicorn web_app:app`` and ``flask --app web_app`` both resolve ``app``
+    through this hook; tests and tooling can import the module without needing a
+    SECRET_KEY in the environment.
+    """
+    if name == "app":
+        return create_app()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 if __name__ == "__main__":
     # Deliberate LAN bind for local use; production runs behind the authenticated ALB.
-    app.run(host=os.environ.get("WEB_HOST", "0.0.0.0"), port=8080)  # nosec B104
+    create_app().run(host=os.environ.get("WEB_HOST", "0.0.0.0"), port=8080)  # nosec B104

@@ -95,7 +95,7 @@ Before each release:
 python -m pytest -q
 python -m pip_audit -r requirements.txt
 python -m bandit -q -r web_app.py security.py checkmarx_sca_consolidator_v2.py
-docker build --pull -t checkmarx-sca-report-studio:release .
+docker build --pull -t checkmarx-sca-stitcher:release .
 ```
 
 Push by immutable digest, review ECR/Inspector findings, and deploy through an

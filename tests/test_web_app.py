@@ -2,6 +2,7 @@ import io
 import json
 import os
 import sqlite3
+import threading
 import time
 import zipfile
 from io import BytesIO
@@ -10,10 +11,16 @@ import jwt
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
+from werkzeug.security import generate_password_hash
 
 os.environ.setdefault("SECRET_KEY", "test-import-secret")
 
-from checkmarx_sca_consolidator_v2 import BUILTIN_GROUP_RULES, build_xlsx_bytes, load_report, make_rows
+from checkmarx_sca_consolidator_v2 import (
+    BUILTIN_GROUP_RULES,
+    ReportError,
+    load_report,
+    make_rows,
+)
 from security import AlbOidcVerifier, AuthenticationError
 from web_app import create_app
 
@@ -199,6 +206,175 @@ def test_admin_cannot_delete_own_account(app, client):
         assert connection.execute("SELECT count(*) FROM users").fetchone()[0] == 1
 
 
+def make_admin(app, username):
+    with sqlite3.connect(app.config["DATABASE"]) as connection:
+        connection.execute(
+            "INSERT INTO users(username, password_hash, is_admin) VALUES (?, ?, 1)",
+            (username, generate_password_hash("a-secure-password")),
+        )
+        connection.commit()
+
+
+def signed_in_admin(app, username):
+    client = app.test_client()
+    response = client.get("/login")
+    client.post(
+        "/login",
+        data={"csrf_token": token(response), "username": username, "password": "a-secure-password"},
+    )
+    return client, token(client.get("/admin"))
+
+
+def admin_usernames(app):
+    with sqlite3.connect(app.config["DATABASE"]) as connection:
+        return sorted(r[0] for r in connection.execute("SELECT username FROM users WHERE is_admin = 1"))
+
+
+@pytest.mark.parametrize("trial", range(6))
+def test_concurrent_mutual_demotion_cannot_remove_every_administrator(app, trial):
+    """Two admins demoting each other at once must not leave the app unmanageable."""
+    create_admin(app)  # 'reviewer'
+    make_admin(app, "second")
+    with sqlite3.connect(app.config["DATABASE"]) as connection:
+        ids = dict(connection.execute("SELECT username, id FROM users"))
+
+    first_client, first_csrf = signed_in_admin(app, "reviewer")
+    second_client, second_csrf = signed_in_admin(app, "second")
+
+    barrier = threading.Barrier(2)
+
+    def demote(client, csrf, target):
+        barrier.wait()
+        client.post(
+            f"/admin/users/{ids[target]}/role", data={"csrf_token": csrf, "is_admin": "0"}
+        )
+
+    threads = [
+        threading.Thread(target=demote, args=(first_client, first_csrf, "second")),
+        threading.Thread(target=demote, args=(second_client, second_csrf, "reviewer")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(admin_usernames(app)) >= 1
+
+
+@pytest.mark.parametrize("trial", range(6))
+def test_concurrent_deletion_cannot_remove_every_administrator(app, trial):
+    create_admin(app)  # 'reviewer'
+    make_admin(app, "second")
+    with sqlite3.connect(app.config["DATABASE"]) as connection:
+        ids = dict(connection.execute("SELECT username, id FROM users"))
+
+    first_client, first_csrf = signed_in_admin(app, "reviewer")
+    second_client, second_csrf = signed_in_admin(app, "second")
+
+    barrier = threading.Barrier(2)
+
+    def delete(client, csrf, target):
+        barrier.wait()
+        client.post(f"/admin/users/{ids[target]}/delete", data={"csrf_token": csrf})
+
+    threads = [
+        threading.Thread(target=delete, args=(first_client, first_csrf, "second")),
+        threading.Thread(target=delete, args=(second_client, second_csrf, "reviewer")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(admin_usernames(app)) >= 1
+
+
+def test_reset_password_can_restore_administrator_access_after_lockout(app, client):
+    create_admin(app)
+    with sqlite3.connect(app.config["DATABASE"]) as connection:
+        connection.execute("UPDATE users SET is_admin = 0")
+        connection.commit()
+    assert admin_usernames(app) == []
+
+    recovered = app.test_cli_runner().invoke(
+        args=["reset-password", "--grant-admin"],
+        input="reviewer\nrecovered-password-2026\nrecovered-password-2026\n",
+    )
+    assert recovered.exit_code == 0, recovered.output
+    assert admin_usernames(app) == ["reviewer"]
+
+    # A plain reset must not silently hand out administrator access.
+    with sqlite3.connect(app.config["DATABASE"]) as connection:
+        connection.execute("UPDATE users SET is_admin = 0")
+        connection.commit()
+    plain = app.test_cli_runner().invoke(
+        args=["reset-password"],
+        input="reviewer\nanother-password-2026\nanother-password-2026\n",
+    )
+    assert plain.exit_code == 0, plain.output
+    assert admin_usernames(app) == []
+
+
+def test_report_processing_bug_is_not_reported_as_invalid_input(app, client, monkeypatch):
+    """A crash inside the consolidator must surface as a 500, not 'invalid report'."""
+    register_and_login(app, client)
+
+    def exploding_make_rows(*args, **kwargs):
+        raise AttributeError("regression in make_rows")
+
+    monkeypatch.setattr("web_app.make_rows", exploding_make_rows)
+    app.config["PROPAGATE_EXCEPTIONS"] = False
+    response = post_report(client, client.get("/"), "preview")
+    assert response.status_code == 500
+
+
+def test_location_fallback_maps_transitive_package_to_direct_package():
+    report = {
+        "RiskReportSummary": {"ProjectName": "Demo"},
+        "Packages": [
+            {
+                "Id": "direct-1",
+                "Name": "app-parent",
+                "Version": "3.0",
+                "IsDirectDependency": True,
+                "Locations": ["services/api/pom.xml"],
+            },
+            {
+                "Id": "trans-1",
+                "Name": "vulnerable-lib",
+                "Version": "1.2",
+                "DependencyType": "Transitive",
+                "HighVulnerabilityCount": 1,
+                "Locations": ["services/api/pom.xml"],
+            },
+        ],
+    }
+    rows, unmapped, _ = make_rows(report, BUILTIN_GROUP_RULES)
+    mapped = [row for row in rows if row["Vulnerable Library"].startswith("vulnerable-lib")]
+    assert mapped, "the vulnerable package should produce a row"
+    assert mapped[0]["Primary Library"] == "app-parent @ 3.0"
+    assert unmapped == []
+
+
+def test_unmapped_rows_do_not_alias_consolidated_rows():
+    report = {
+        "RiskReportSummary": {"ProjectName": "Demo"},
+        "Packages": [
+            {
+                "Id": "trans-1",
+                "Name": "orphan-lib",
+                "Version": "1.0",
+                "DependencyType": "Transitive",
+                "HighVulnerabilityCount": 1,
+            }
+        ],
+    }
+    rows, unmapped, _ = make_rows(report, BUILTIN_GROUP_RULES)
+    assert unmapped, "an unresolvable package should be reported as unmapped"
+    unmapped[0]["Project"] = "mutated"
+    assert rows[0]["Project"] == "Demo"
+
+
 def test_workspace_ui_exposes_formats_and_strict_styles(app, client):
     register_and_login(app, client)
     response = client.get("/")
@@ -275,7 +451,7 @@ def test_zip_json_member_size_is_capped(tmp_path):
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr("SCA_ScanReport.json", json.dumps(sample_report()))
 
-    with pytest.raises(SystemExit):
+    with pytest.raises(ReportError, match="too large"):
         load_report(archive, max_json_bytes=10)
 
 

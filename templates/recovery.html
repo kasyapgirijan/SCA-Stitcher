@@ -13,6 +13,7 @@
     <code>flask --app web_app reset-password</code>
   </div>
   <p class="recovery-note">The temporary password must be replaced immediately after sign-in.</p>
+  <p class="recovery-note">If no administrator account remains, add <code>--grant-admin</code> to restore the role.</p>
   <a class="button button-secondary button-full" href="{{ url_for('login') }}">Back to sign in</a>
 </section>
 {% endblock %}
