@@ -146,7 +146,12 @@ Uploads default to a 25 MiB limit (`MAX_UPLOAD_BYTES`); JSON members extracted f
 uploads are capped to the same limit. Nesting depth, node count, package count, row
 count, request rate, and generated-output size are all bounded and configurable — see
 `.env.example`. CLI report parsing defaults to a 100 MiB JSON cap
-(`MAX_REPORT_BYTES`).
+(`MAX_REPORT_BYTES`); that variable applies to the CLI only, not to the web service.
+
+The in-browser preview renders at most `MAX_PREVIEW_ROWS` rows (default 2000) and says
+so when it truncates; downloads are never truncated. `TRUST_PROXY_HOPS` defaults to 0,
+which ignores `X-Forwarded-*` entirely — set it to the number of proxies in front of
+the app so audit events and the per-IP login limiter see the real client address.
 
 Production dependencies are exact and hash-locked in `requirements.txt`; regenerate the
 lock from `requirements.in`. Development and audit tooling is isolated in
@@ -159,9 +164,12 @@ python -m pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-The suite covers authentication and role enforcement, CSRF, rate limiting, spreadsheet
-formula-injection neutralization, export sandboxing, report size and structure limits,
-ALB assertion verification, and concurrency guards on administrator role changes.
+The suite covers authentication and role enforcement, CSRF rejection on every
+state-changing route, rate limiting, spreadsheet formula-injection neutralization,
+export sandboxing, report size and structure limits, preview row bounds, audit-record
+attribution and log-injection resistance, forwarded-header trust, ALB assertion
+verification and signing-key cache behavior, and concurrency guards on administrator
+role changes.
 
 ## Notes
 
