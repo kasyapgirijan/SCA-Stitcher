@@ -21,9 +21,13 @@ import checkmarx_sca_consolidator_v2
 from checkmarx_sca_consolidator_v2 import (
     BUILTIN_GROUP_RULES,
     ReportError,
+    as_int,
+    decode_report,
     env_int,
     load_report,
     make_rows,
+    recursive_dicts,
+    validate_json_structure,
 )
 from security import AlbOidcVerifier, AuthenticationError, SlidingWindowLimiter
 from web_app import create_app
@@ -993,3 +997,232 @@ def test_session_lifetime_honours_an_explicit_override(monkeypatch, tmp_path):
         }
     )
     assert app.config["PERMANENT_SESSION_LIFETIME"] == timedelta(minutes=600)
+
+
+# --- Pre-expansion resource budgets ----------------------------------------
+
+
+def test_structural_budget_counts_scalars_not_just_containers():
+    """A wide scalar array is real work; counting only containers missed it."""
+    payload = {"junk": list(range(100_000))}
+    with pytest.raises(ReportError, match="structural limit"):
+        validate_json_structure(payload, max_depth=64, max_nodes=2)
+    with pytest.raises(ReportError, match="structural limit"):
+        list(recursive_dicts(payload, max_depth=64, max_nodes=2))
+
+
+def test_structural_budget_still_admits_an_ordinary_report():
+    assert validate_json_structure(sample_report(), max_depth=64, max_nodes=2_000_000)
+
+
+def test_zip_member_count_is_capped(tmp_path):
+    archive = tmp_path / "many.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        for index in range(11):
+            zf.writestr(f"member-{index}.json", "{}")
+
+    with pytest.raises(ReportError, match="more than the allowed 10 members"):
+        load_report(archive, max_zip_members=10)
+
+
+def test_zip_member_selection_prefers_the_sca_report(tmp_path):
+    archive = tmp_path / "scan.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("aaa.json", json.dumps({"Packages": []}))
+        zf.writestr("SCA_ScanReport.json", json.dumps(sample_report("Chosen")))
+
+    assert load_report(archive)["RiskReportSummary"]["ProjectName"] == "Chosen"
+
+
+def amplifying_report(locations=1000):
+    """A few kilobytes of input that expands into megabytes of cells."""
+    return {
+        "RiskReportSummary": {"ProjectName": "P" * 200},
+        "Packages": [
+            {
+                "Id": "direct",
+                "Name": "lib",
+                "Version": "1.0",
+                "IsDirectDependency": True,
+                "HighVulnerabilityCount": 1,
+                "Locations": [f"location/{index}" for index in range(locations)],
+            }
+        ],
+    }
+
+
+def test_content_budget_stops_expansion_before_any_format_is_serialized():
+    report = amplifying_report()
+    rows, _, _ = make_rows(report, BUILTIN_GROUP_RULES)
+    assert len(rows) == 1000  # allowed under the default budget
+
+    with pytest.raises(ReportError, match="content budget"):
+        make_rows(report, BUILTIN_GROUP_RULES, max_content_chars=50_000)
+
+
+def test_every_output_format_is_bounded_by_the_same_budget(app, client):
+    """Row count alone does not bound output, so the budget applies at the source."""
+    app.config["MAX_REPORT_CONTENT_CHARS"] = 50_000
+    register_and_login(app, client)
+    for output_format in ("preview", "csv", "html", "xlsx"):
+        response = post_report(client, client.get("/"), output_format, amplifying_report())
+        assert response.status_code == 302, output_format
+        assert response.headers["Location"].endswith("/")
+
+
+def test_csv_writing_stops_at_the_export_cap(app, client):
+    app.config["MAX_EXPORT_BYTES"] = 4096
+    register_and_login(app, client)
+    assert post_report(client, client.get("/"), "csv", amplifying_report(400)).status_code == 413
+
+
+# --- Location mapping -------------------------------------------------------
+
+
+def location_report(direct, transitive_location):
+    return {
+        "RiskReportSummary": {"ProjectName": "Demo"},
+        "Packages": [
+            *[
+                {
+                    "Id": f"direct-{index}",
+                    "Name": name,
+                    "Version": "1",
+                    "IsDirectDependency": True,
+                    "Locations": [location],
+                }
+                for index, (name, location) in enumerate(direct)
+            ],
+            {
+                "Id": "trans-1",
+                "Name": "victim",
+                "Version": "9",
+                "DependencyType": "Transitive",
+                "HighVulnerabilityCount": 1,
+                "Locations": [transitive_location],
+            },
+        ],
+    }
+
+
+def victim_mapping(direct, transitive_location):
+    rows, _, _ = make_rows(location_report(direct, transitive_location), BUILTIN_GROUP_RULES)
+    row = next(row for row in rows if row["Vulnerable Library"].startswith("victim"))
+    return row["Primary Library"], row["Mapping Source"]
+
+
+API = ("direct-a", "services/api/pom.xml")
+WEB = ("direct-b", "services/web/pom.xml")
+
+
+def test_unrelated_sibling_paths_do_not_map_to_a_shared_repository_root():
+    """The shared 'services' ancestor previously captured unrelated siblings."""
+    primary, source = victim_mapping([API, WEB], "services/worker/pom.xml")
+    assert primary == "Unmapped Primary Library"
+    assert source == "unmapped"
+
+
+def test_exact_and_descendant_locations_still_map():
+    assert victim_mapping([API], "services/api/pom.xml")[0] == "direct-a @ 1"
+    # A manifest governs its own directory, so a file beneath it resolves.
+    assert victim_mapping([API], "services/api/lib/vendored.jar")[0] == "direct-a @ 1"
+
+
+def test_a_shared_manifest_is_reported_as_ambiguous_rather_than_guessed():
+    duplicate = [("direct-a", "services/api/pom.xml"), ("direct-b", "services/api/pom.xml")]
+    primary, source = victim_mapping(duplicate, "services/api/pom.xml")
+    assert primary == "Unmapped Primary Library"
+    assert source == "ambiguous location scope"
+
+
+def test_location_mapping_does_not_depend_on_package_order():
+    duplicate = [("direct-a", "services/api/pom.xml"), ("direct-b", "services/api/pom.xml")]
+    assert victim_mapping(duplicate, "services/api/pom.xml") == victim_mapping(
+        duplicate[::-1], "services/api/pom.xml"
+    )
+    siblings = [API, WEB]
+    assert victim_mapping(siblings, "services/api/pom.xml") == victim_mapping(
+        siblings[::-1], "services/api/pom.xml"
+    )
+
+
+# --- Error classification ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "report, message",
+    [
+        ({"Packages": [1]}, "Packages\\[0\\] must be a JSON object"),
+        ({"Packages": ["x", {}]}, "Packages\\[0\\] must be a JSON object"),
+        ({"Packages": [], "RiskReportSummary": []}, "RiskReportSummary must be a JSON object"),
+        ({"Packages": [], "RiskReportSummary": "name"}, "RiskReportSummary must be a JSON object"),
+    ],
+)
+def test_malformed_report_shapes_are_invalid_input_not_internal_errors(report, message):
+    with pytest.raises(ReportError, match=message):
+        make_rows(report, BUILTIN_GROUP_RULES)
+
+
+@pytest.mark.parametrize("literal", [b'{"Packages":[{"n":Infinity}]}', b'{"Packages":[{"n":NaN}]}'])
+def test_non_finite_json_constants_are_rejected_at_the_parser(literal):
+    with pytest.raises(ReportError, match="unsupported JSON constant"):
+        decode_report(literal)
+
+
+def test_overflowing_numeric_literals_do_not_crash_counting():
+    """1e400 parses as a float infinity without going through parse_constant."""
+    assert as_int(json.loads("1e400")) == 0
+    assert as_int(json.loads("-1e400")) == 0
+
+
+def test_malformed_package_shape_reaches_the_user_as_invalid_input(app, client):
+    register_and_login(app, client)
+    response = post_report(client, client.get("/"), "preview", {"Packages": [1]})
+
+    assert response.status_code == 302
+    assert b"invalid or exceeds a safety limit" in client.get("/").data
+
+
+def test_operational_oserror_is_surfaced_as_a_logged_failure(app, client, monkeypatch):
+    """A full disk is not bad input and must stay visible to monitoring."""
+    register_and_login(app, client)
+
+    def exploding_load_report(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("web_app.load_report", exploding_load_report)
+    app.config["PROPAGATE_EXCEPTIONS"] = False
+    assert post_report(client, client.get("/"), "preview").status_code == 500
+
+
+def test_content_budget_does_not_contradict_the_row_limit():
+    """A full-size report of ordinary width must fit under the default budget."""
+    report = {
+        "RiskReportSummary": {"ProjectName": "acme-platform-services"},
+        "Packages": [
+            {
+                "Id": "Maven-org.springframework:spring-core-5.3.20",
+                "Name": "org.springframework:spring-core",
+                "Version": "5.3.20",
+                "IsDirectDependency": True,
+                "Locations": ["services/api/pom.xml"],
+            },
+            *[
+                {
+                    "Id": f"Maven-com.example:lib-{index}-1.2.{index}",
+                    "Name": f"com.example:transitive-library-{index}",
+                    "Version": f"1.2.{index}",
+                    "DependencyType": "Transitive",
+                    "HighVulnerabilityCount": 1,
+                    "NewestVersion": f"2.0.{index}",
+                    "Locations": ["services/api/pom.xml"],
+                    "Vulnerabilities": [{"CVE": f"CVE-2026-{index:05d}", "CVSS": 9.8}],
+                }
+                for index in range(2000)
+            ],
+        ],
+    }
+    rows, _, _ = make_rows(report, BUILTIN_GROUP_RULES)
+    chars_per_row = sum(sum(len(v) for v in row.values()) for row in rows) / len(rows)
+    # Headroom for a full MAX_REPORT_ROWS report at this width.
+    assert chars_per_row * 50_000 < 64_000_000

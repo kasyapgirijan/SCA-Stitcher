@@ -74,12 +74,23 @@ def validate_https_url(value: str, setting: str) -> None:
         raise RuntimeError(f"{setting} must be an absolute HTTPS URL.")
 
 
-def csv_payload(rows: list[dict[str, str]]) -> bytes:
+def csv_payload(rows: list[dict[str, str]], max_bytes: int) -> bytes:
+    """Serialize rows to CSV, abandoning the write once the cap is passed.
+
+    The size check happens while writing rather than afterwards so an
+    oversized export never fully materializes in the worker.
+    """
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=OUTPUT_COLUMNS, extrasaction="ignore")
     writer.writeheader()
-    writer.writerows({key: spreadsheet_safe(value) for key, value in row.items()} for row in rows)
-    return ("﻿" + output.getvalue()).encode("utf-8")
+    for index, row in enumerate(rows, start=1):
+        writer.writerow({key: spreadsheet_safe(value) for key, value in row.items()})
+        if index % 256 == 0 and output.tell() > max_bytes:
+            abort(413)
+    payload = ("﻿" + output.getvalue()).encode("utf-8")
+    if len(payload) > max_bytes:
+        abort(413)
+    return payload
 
 
 def attachment(payload: bytes, mimetype: str, filename: str, max_bytes: int, **headers: str) -> Response:
@@ -103,7 +114,7 @@ def export_response(
 ) -> Any:
     """Serialize a consolidated report in the requested format."""
     if output_format == "csv":
-        return attachment(csv_payload(rows), "text/csv", f"{EXPORT_BASENAME}.csv", max_bytes)
+        return attachment(csv_payload(rows, max_bytes), "text/csv", f"{EXPORT_BASENAME}.csv", max_bytes)
 
     if output_format == "html":
         return attachment(
@@ -172,7 +183,13 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         MAX_FORM_MEMORY_SIZE=512 * 1024,
         MAX_FORM_PARTS=20,
         MAX_JSON_DEPTH=env_int("MAX_JSON_DEPTH", 64, 8, 256, test_config),
-        MAX_JSON_NODES=env_int("MAX_JSON_NODES", 250_000, 1_000, 2_000_000, test_config),
+        # Counts every JSON value including scalars, so the ceiling is well
+        # above the old container-only figure.
+        MAX_JSON_NODES=env_int("MAX_JSON_NODES", 2_000_000, 1_000, 20_000_000, test_config),
+        MAX_ZIP_MEMBERS=env_int("MAX_ZIP_MEMBERS", 10_000, 1, 200_000, test_config),
+        MAX_REPORT_CONTENT_CHARS=env_int(
+            "MAX_REPORT_CONTENT_CHARS", 64_000_000, 100_000, 512_000_000, test_config
+        ),
         MAX_REPORT_PACKAGES=env_int("MAX_REPORT_PACKAGES", 100_000, 1, 500_000, test_config),
         MAX_REPORT_ROWS=env_int("MAX_REPORT_ROWS", 50_000, 1, 250_000, test_config),
         MAX_PREVIEW_ROWS=env_int("MAX_PREVIEW_ROWS", 2_000, 10, 50_000, test_config),
@@ -880,6 +897,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                         max_json_bytes=app.config["MAX_CONTENT_LENGTH"],
                         max_depth=app.config["MAX_JSON_DEPTH"],
                         max_nodes=app.config["MAX_JSON_NODES"],
+                        max_zip_members=app.config["MAX_ZIP_MEMBERS"],
                     )
                     rows, unmapped, diagnostics = make_rows(
                         source,
@@ -888,14 +906,20 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                         max_rows=app.config["MAX_REPORT_ROWS"],
                         max_depth=app.config["MAX_JSON_DEPTH"],
                         max_nodes=app.config["MAX_JSON_NODES"],
+                        max_content_chars=app.config["MAX_REPORT_CONTENT_CHARS"],
                     )
-            except (ReportError, OSError, zipfile.BadZipFile) as exc:
+            # OSError is deliberately absent here. A full disk, a permission
+            # problem, or a failure writing the temporary upload is an
+            # operational fault, not bad input, and must reach the logged 500
+            # path below so it is visible to monitoring.
+            except (ReportError, zipfile.BadZipFile) as exc:
                 audit("report_processing", "rejected", error_type=type(exc).__name__)
                 flash("Could not process the report because it is invalid or exceeds a safety limit.")
                 return redirect(url_for("index"))
             except Exception as exc:
-                # A bug in the consolidator, not bad input. Log the traceback so it
-                # is not silently misreported to the user as an invalid report.
+                # A bug in the consolidator or an operational failure, not bad
+                # input. Log the traceback so it is not silently misreported to
+                # the user as an invalid report.
                 audit("report_processing", "error", error_type=type(exc).__name__)
                 app.logger.exception("Unhandled failure while consolidating a report.")
                 abort(500)

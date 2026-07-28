@@ -14,6 +14,7 @@ import argparse
 import csv
 import io
 import json
+import math
 import os
 import re
 import sys
@@ -97,9 +98,21 @@ def env_int(
 
 DEFAULT_MAX_REPORT_BYTES = env_int("MAX_REPORT_BYTES", 100 * 1024 * 1024)
 DEFAULT_MAX_JSON_DEPTH = env_int("MAX_JSON_DEPTH", 64)
-DEFAULT_MAX_JSON_NODES = env_int("MAX_JSON_NODES", 250_000)
+# Counts every JSON value, scalars included. It previously counted only
+# containers, so a list of a million numbers passed a limit of two. The default
+# is correspondingly higher than the old container-only figure.
+DEFAULT_MAX_JSON_NODES = env_int("MAX_JSON_NODES", 2_000_000)
 DEFAULT_MAX_PACKAGES = env_int("MAX_REPORT_PACKAGES", 100_000)
 DEFAULT_MAX_ROWS = env_int("MAX_REPORT_ROWS", 50_000)
+DEFAULT_MAX_ZIP_MEMBERS = env_int("MAX_ZIP_MEMBERS", 10_000)
+# Bounds generated content while rows are built, before any format is
+# serialized. Row count alone does not bound output: a report with wide cells
+# amplifies a few kilobytes of input into megabytes of CSV. The default sits
+# well above a full MAX_REPORT_ROWS report of ordinary width (measured at
+# roughly 350 characters per row, so ~18M for 50,000 rows) so that the two
+# limits do not contradict each other; its job is to bound the pathological
+# case, not to be tight.
+DEFAULT_MAX_CONTENT_CHARS = env_int("MAX_REPORT_CONTENT_CHARS", 64_000_000)
 # Leading whitespace is stripped before the prefix test, so only the characters
 # a spreadsheet treats as the start of a formula belong here. The full-width
 # variants are included because Excel normalizes them.
@@ -175,10 +188,28 @@ def validate_json_structure(
         if depth > max_depth:
             raise ReportError(f"Report exceeds the maximum nesting depth of {max_depth}.")
         if isinstance(current, dict):
-            stack.extend((item, depth + 1) for item in current.values() if isinstance(item, (dict, list)))
+            children: Iterable[Any] = current.values()
         elif isinstance(current, list):
-            stack.extend((item, depth + 1) for item in current if isinstance(item, (dict, list)))
+            children = current
+        else:
+            continue
+        # Scalars are counted but never pushed: they contribute to the budget
+        # without letting a wide array grow the traversal stack. The check has
+        # to happen here, not only when popping, or a trailing run of scalars
+        # empties the stack and exits the loop unchecked.
+        for item in children:
+            if isinstance(item, (dict, list)):
+                stack.append((item, depth + 1))
+            else:
+                nodes += 1
+        if nodes > max_nodes:
+            raise ReportError(f"Report exceeds the structural limit of {max_nodes} JSON nodes.")
     return value
+
+
+def reject_json_constant(name: str) -> Any:
+    """Refuse Infinity/-Infinity/NaN, which int() cannot convert."""
+    raise ReportError(f"Report contains the unsupported JSON constant {name}.")
 
 
 def decode_report(
@@ -187,7 +218,7 @@ def decode_report(
     max_nodes: int = DEFAULT_MAX_JSON_NODES,
 ) -> Dict[str, Any]:
     try:
-        parsed = json.loads(raw.decode("utf-8-sig"))
+        parsed = json.loads(raw.decode("utf-8-sig"), parse_constant=reject_json_constant)
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise ReportError("Report is not valid UTF-8 JSON within the supported nesting limit.") from exc
     return validate_json_structure(parsed, max_depth=max_depth, max_nodes=max_nodes)
@@ -198,6 +229,7 @@ def load_report(
     max_json_bytes: int | None = DEFAULT_MAX_REPORT_BYTES,
     max_depth: int = DEFAULT_MAX_JSON_DEPTH,
     max_nodes: int = DEFAULT_MAX_JSON_NODES,
+    max_zip_members: int = DEFAULT_MAX_ZIP_MEMBERS,
 ) -> Dict[str, Any]:
     if not path.exists():
         raise ReportError(f"Input file not found: {path}")
@@ -208,11 +240,23 @@ def load_report(
         except zipfile.BadZipFile as exc:
             raise ReportError("Upload is not a readable ZIP archive.") from exc
         with archive as zf:
-            json_names = [n for n in zf.namelist() if n.lower().endswith(".json")]
-            if not json_names:
+            members = zf.infolist()
+            # A small archive can declare a very large number of members, so cap
+            # the count before doing any per-member work.
+            if len(members) > max_zip_members:
+                raise ReportError(
+                    f"ZIP contains more than the allowed {max_zip_members} members."
+                )
+            # A single linear pass, rather than sorting every member name.
+            preferred_info = min(
+                (info for info in members if info.filename.lower().endswith(".json")),
+                key=lambda info: ("sca" not in info.filename.lower(), len(info.filename), info.filename),
+                default=None,
+            )
+            if preferred_info is None:
                 raise ReportError("ZIP does not contain a JSON report.")
-            preferred = sorted(json_names, key=lambda n: ("sca" not in n.lower(), len(n)))[0]
-            info = zf.getinfo(preferred)
+            preferred = preferred_info.filename
+            info = preferred_info
             if max_json_bytes is not None and info.file_size > max_json_bytes:
                 raise ReportError(
                     f"JSON report inside ZIP is too large ({info.file_size} bytes; limit {max_json_bytes} bytes)."
@@ -248,8 +292,16 @@ def text_or_blank(value: Any) -> str:
 
 def as_int(value: Any) -> int:
     try:
-        return int(float(value or 0))
+        number = float(value or 0)
     except (TypeError, ValueError):
+        return 0
+    # A literal such as 1e400 parses as a float infinity without going through
+    # parse_constant, and int() raises OverflowError on it.
+    if not math.isfinite(number):
+        return 0
+    try:
+        return int(number)
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 
@@ -351,13 +403,39 @@ def normalize_package_paths(raw: Any) -> List[List[PackageRef]]:
     return chains
 
 
-def location_keys(location: str) -> List[str]:
+def normalize_location(location: str) -> str:
+    return location.replace("\\", "/").strip().strip("/")
+
+
+def location_ancestors(location: str) -> List[str]:
     """Return a location and each of its ancestor directories, nearest first."""
-    normalized = location.replace("\\", "/").strip().strip("/")
+    normalized = normalize_location(location)
     if not normalized:
         return []
     parts = normalized.split("/")
     return ["/".join(parts[:index]) for index in range(len(parts), 0, -1)]
+
+
+def location_scopes(location: str) -> List[str]:
+    """Return the directory scopes a direct package at ``location`` governs.
+
+    A manifest governs the directory that contains it, so
+    ``services/api/pom.xml`` scopes both itself and ``services/api``. A location
+    that is already a directory scopes only itself.
+
+    This deliberately stops there. Indexing every ancestor let a shared
+    repository root such as ``services`` capture unrelated siblings, so a
+    transitive package under ``services/worker`` resolved to whichever direct
+    package under ``services`` happened to be indexed first.
+    """
+    normalized = normalize_location(location)
+    if not normalized:
+        return []
+    scopes = [normalized]
+    head, _, tail = normalized.rpartition("/")
+    if head and "." in tail:
+        scopes.append(head)
+    return scopes
 
 
 def build_indexes(packages: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
@@ -365,10 +443,11 @@ def build_indexes(packages: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     by_name_version: Dict[str, Dict[str, Any]] = {}
     by_name: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     direct_packages: List[Dict[str, Any]] = []
-    # Maps a direct package's location, and every ancestor directory of it, to
-    # that package. Lets infer_primary() resolve a location in constant time
-    # instead of comparing every transitive package against every direct one.
-    by_direct_location: Dict[str, Dict[str, Any]] = {}
+    # Maps each scope a direct package governs to every direct package claiming
+    # it. The value is a list, not a single package: when several direct
+    # packages share a scope the mapping is genuinely ambiguous and must not be
+    # resolved by insertion order.
+    by_direct_location: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
     for pkg in packages:
         ref = PackageRef.from_obj(pkg)
@@ -381,8 +460,8 @@ def build_indexes(packages: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         if is_direct(pkg):
             direct_packages.append(pkg)
             for raw_location in as_list(pkg.get("Locations")):
-                for key in location_keys(text_or_blank(raw_location)):
-                    by_direct_location.setdefault(key, pkg)
+                for key in location_scopes(text_or_blank(raw_location)):
+                    by_direct_location[key].append(pkg)
 
     return {
         "by_id": by_id,
@@ -424,12 +503,26 @@ def infer_primary(pkg: Dict[str, Any], chain: List[PackageRef], indexes: Dict[st
             return PackageRef.from_obj(mapped), "first PackagePaths node resolved", not is_direct(mapped)
         return first, "first PackagePaths node inferred", True
 
+    ambiguous = False
     for raw_location in as_list(pkg.get("Locations")):
-        for key in location_keys(text_or_blank(raw_location)):
-            mapped = indexes["by_direct_location"].get(key)
-            if mapped is not None:
-                return PackageRef.from_obj(mapped), "location prefix matched direct package", False
+        for key in location_ancestors(text_or_blank(raw_location)):
+            candidates = indexes["by_direct_location"].get(key)
+            if not candidates:
+                continue
+            unique = {id(candidate): candidate for candidate in candidates}
+            if len(unique) == 1:
+                mapped = next(iter(unique.values()))
+                return PackageRef.from_obj(mapped), "location scope matched direct package", False
+            # Several direct packages govern this scope, so which one pulls the
+            # transitive package in is unknown. Naming the first would tell a
+            # developer to upgrade the wrong library; reporting it as unmapped
+            # is the honest answer. Broader ancestors can only be more
+            # ambiguous, so stop here.
+            ambiguous = True
+            break
 
+    if ambiguous:
+        return PackageRef("", "Unmapped Primary Library", ""), "ambiguous location scope", True
     return PackageRef("", "Unmapped Primary Library", ""), "unmapped", True
 
 
@@ -454,9 +547,18 @@ def recursive_dicts(
             raise ReportError(f"Object exceeds the maximum nesting depth of {max_depth}.")
         if isinstance(current, dict):
             yield current
-            stack.extend((item, depth + 1) for item in current.values() if isinstance(item, (dict, list)))
+            children: Iterable[Any] = current.values()
         elif isinstance(current, list):
-            stack.extend((item, depth + 1) for item in current if isinstance(item, (dict, list)))
+            children = current
+        else:
+            continue
+        for item in children:
+            if isinstance(item, (dict, list)):
+                stack.append((item, depth + 1))
+            else:
+                nodes += 1
+        if nodes > max_nodes:
+            raise ReportError(f"Object exceeds the structural limit of {max_nodes} nodes.")
 
 
 def extract_vulns(
@@ -504,19 +606,35 @@ def make_rows(
     max_rows: int = DEFAULT_MAX_ROWS,
     max_depth: int = DEFAULT_MAX_JSON_DEPTH,
     max_nodes: int = DEFAULT_MAX_JSON_NODES,
+    max_content_chars: int = DEFAULT_MAX_CONTENT_CHARS,
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], Dict[str, Any]]:
     packages = report.get("Packages") or []
     if not isinstance(packages, list):
         raise ReportError("Report does not contain a Packages[] array.")
     if len(packages) > max_packages:
         raise ReportError(f"Report contains more than the allowed {max_packages} packages.")
+    # Validated up front so a malformed entry is reported as invalid input with
+    # its position, rather than surfacing as an AttributeError from deep inside
+    # PackageRef.from_obj() and being logged as an internal fault.
+    for index, pkg in enumerate(packages):
+        if not isinstance(pkg, dict):
+            raise ReportError(f"Packages[{index}] must be a JSON object.")
 
-    summary = report.get("RiskReportSummary") or {}
+    raw_summary = report.get("RiskReportSummary")
+    if raw_summary is None:
+        summary: Dict[str, Any] = {}
+    elif isinstance(raw_summary, dict):
+        summary = raw_summary
+    else:
+        # Checked against the raw value rather than after `or {}`, so a falsy
+        # non-object such as [] is rejected instead of silently treated as absent.
+        raise ReportError("RiskReportSummary must be a JSON object.")
     project = text_or_blank(summary.get("ProjectName")) or text_or_blank(report.get("ProjectName")) or "Unknown Project"
     indexes = build_indexes(packages)
 
     rows: List[Dict[str, str]] = []
     unmapped: List[Dict[str, str]] = []
+    content_chars = 0
     diagnostics = {
         "project": project,
         "packages_total": len(packages),
@@ -592,6 +710,14 @@ def make_rows(
                     "Group Reason": group_reason,
                     **severity_counts,
                 }
+                # Enforced as the row is built, so a report that amplifies a few
+                # kilobytes of input into megabytes of cells is stopped here
+                # rather than after every export format has been materialized.
+                content_chars += sum(len(value) for value in row.values())
+                if content_chars > max_content_chars:
+                    raise ReportError(
+                        f"Consolidated report exceeds the {max_content_chars}-character content budget."
+                    )
                 rows.append(row)
                 if is_unmapped or primary.name == "Unmapped Primary Library":
                     # A copy, so later edits to one view never mutate the other.
