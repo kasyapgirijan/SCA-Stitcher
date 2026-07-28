@@ -69,11 +69,20 @@ To resolve a vulnerable package to its primary library, SCA Stitcher tries, in o
 2. Exact package ID.
 3. Package name and version.
 4. A unique package name.
-5. The manifest location, matched against direct packages in the same file or an
-   ancestor directory.
+5. The manifest location. A direct package covers its own location and, when that
+   location is a file, the directory containing it — so `services/api/pom.xml` covers
+   `services/api`. The most specific covering location wins, and it must have exactly
+   one direct package claiming it.
+
+Step 5 deliberately does not walk further up the tree. Matching on a shared repository
+root would let a transitive package under `services/worker` be attributed to an
+unrelated direct package under `services/api`, which points a developer at the wrong
+upgrade. For the same reason, when several direct packages share one manifest the
+result is recorded as ambiguous rather than resolved to an arbitrary one of them.
 
 Anything still unresolved is written to `unmapped_libraries.csv` and the Excel
-`Unmapped` sheet rather than being silently dropped or guessed at.
+`Unmapped` sheet rather than being silently dropped or guessed at. The `Mapping Source`
+column records which step produced each row, including `ambiguous location scope`.
 
 Grouping rolls up related findings so a team sees one item instead of twenty: the same
 primary library at different versions collapses into one `Library Group`, and built-in
@@ -172,10 +181,6 @@ export sandboxing, report size and structure limits, preview row bounds, audit-r
 attribution and log-injection resistance, forwarded-header trust, ALB assertion
 verification and signing-key cache behavior, concurrency guards on administrator
 role changes, and dependency-location mapping including ambiguous and unrelated paths.
-
-When several direct packages share a manifest, a vulnerable transitive package that can
-only be resolved by file location is reported as unmapped rather than attributed to an
-arbitrary one of them — check the `Unmapped` sheet for these.
 
 ## Notes
 
