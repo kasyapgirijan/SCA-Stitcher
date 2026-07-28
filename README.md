@@ -1,77 +1,36 @@
 # SCA Stitcher
 
-Stitches native Checkmarx SCA JSON reports into developer-friendly Excel/CSV/HTML output, mapping each vulnerable transitive package back to the primary library a developer should actually upgrade.
+Consolidates Checkmarx SCA scan reports into developer-friendly Excel, CSV, and HTML output — stitching every vulnerable transitive package back to the primary library a developer should actually upgrade.
 
-The repository also includes an authenticated Docker web application ("SCA Stitcher") for private, ephemeral report processing. Uploads, previews, exports, and report metadata are not persisted.
-
-## Docker web application
-
-Copy the environment template and replace `SECRET_KEY` with a long random value:
-
-```powershell
-Copy-Item .env.example .env
-python -c "import secrets; print(secrets.token_hex(32))"
-docker compose up --build
-```
-
-Paste the generated value after `SECRET_KEY=` in `.env`. The template also documents the secure-cookie setting and report size limits. Keep `.env` local; it is ignored by Git.
-
-Build the image, provision a local-development administrator from the protected CLI, and start the service:
-
-```powershell
-docker compose build
-docker compose run --rm web flask --app web_app create-admin
-docker compose up
-```
-
-Open <http://localhost:8080> and upload a `.json` or `.zip` report. You can preview the consolidated findings, print/save the preview as PDF for sharing, or download CSV, Excel, or standalone HTML directly. The named Docker volume contains only the local-development `users.db`; report files are processed in temporary storage and deleted at the end of each request.
-
-The HTTP first-account setup route has been removed. Production refuses to start with local password authentication and requires verified AWS ALB OIDC/Cognito identity, secure cookies, a strong secret, and trusted hosts. Review [the production security assessment](docs/security-assessment.md), follow [the AWS production guide](docs/aws-production.md), and start from [the ECS task-definition example](aws/ecs-task-definition.example.json).
-
-Local administrators can manage accounts at `/admin`. Users created or reset there
-must replace their temporary password at the next sign-in.
-
-Reset a forgotten password from the server console:
-
-```powershell
-flask --app web_app reset-password
-```
-
-If every administrator has lost the admin role, `--grant-admin` restores it on an
-existing account. A plain `reset-password` deliberately does not change roles:
-
-```powershell
-flask --app web_app list-admins
-flask --app web_app reset-password --grant-admin
-```
-
-Uploads default to a 25 MiB limit, configurable with `MAX_UPLOAD_BYTES`; extracted JSON members inside ZIP uploads are capped to the same limit. Depth, node, package, row, request-rate, and generated-output limits are also configurable in `.env.example`. CLI report parsing defaults to a 100 MiB JSON cap, configurable with `MAX_REPORT_BYTES`.
-
-Production dependencies are exact and hash-locked in `requirements.txt`. Regenerate the lock from `requirements.in`; development and audit tooling is isolated in `requirements-dev.txt`.
-
-The main version is:
-
-```text
-checkmarx_sca_consolidator_v2.py
-```
-
-It reads the local exported `SCA_ScanReport.json` or a ZIP containing the JSON. It does **not** need a Checkmarx API key, and it does **not** create Jira tickets.
+Runs as a command-line tool or as an authenticated web application. It reads a local
+`SCA_ScanReport.json` (or a ZIP containing it), so it needs **no Checkmarx API key**
+and never calls back to Checkmarx.
 
 ## Why this exists
 
-Checkmarx SCA reports may show direct and transitive dependency information, but the standard exports are not always ready for Jira or EPD teams. This script consolidates findings so the team can work from the primary/direct library while still seeing the vulnerable transitive package path, file location, CVE/Cx ID, and CVSS score.
+Checkmarx SCA reports list direct and transitive dependency findings, but the standard
+exports are not shaped for the people who fix them. A developer handed a raw export
+sees a vulnerable transitive package and no obvious answer to the only question that
+matters: *which dependency do I actually bump?*
 
-## Install
+SCA Stitcher answers that. It resolves each vulnerable transitive package to the
+primary library that pulls it in, groups findings by that library, and keeps the
+supporting evidence — dependency path, file location, CVE/Cx ID, and CVSS score —
+attached to every row. The result is ready to hand to an application team or to raise
+work from in Jira.
 
-CSV and HTML output work with Python standard library only.
+It consolidates and maps findings. It does not create Jira tickets.
 
-For Excel output:
+## Quick start
+
+CSV and HTML output need only the Python standard library. Excel output needs
+XlsxWriter:
 
 ```powershell
 python -m pip install XlsxWriter
 ```
 
-## Run
+Run against an exported report:
 
 ```powershell
 python .\checkmarx_sca_consolidator_v2.py `
@@ -90,8 +49,6 @@ python .\checkmarx_sca_consolidator_v2.py `
 
 ## Outputs
 
-The script generates:
-
 ```text
 sca_consolidated\sca_stitcher_consolidated.xlsx
 sca_consolidated\sca_stitcher_consolidated.csv
@@ -101,18 +58,116 @@ sca_consolidated\consolidated_preview.html
 sca_consolidated\schema_diagnostics.json
 ```
 
-## Implemented requirements
+The Excel workbook carries the consolidated rows, a per-group summary, the unmapped
+findings, and the run diagnostics as separate sheets.
 
-- Vulnerability column contains only `CVE/Cx ID | CVSS score`; severity is not appended there.
-- Adds current version, latest version, and `Is Latest?` for both primary and vulnerable libraries.
-- Groups same primary library with different versions under one `Library Group`.
-- Groups ESLint-related packages such as `eslint`, `eslint-plugin-react-hooks`, and `eslint-plugin-react-refresh` under `ESLint`.
-- Groups BIRT-related findings under `BIRT`.
-- Uses `PackagePaths`, exact package ID, package name/version, unique package name, and location matching to reduce unmapped primary libraries.
-- Writes unresolved/ambiguous mappings to `unmapped_libraries.csv` and the Excel `Unmapped` sheet.
+## How the mapping works
 
-## Important notes
+To resolve a vulnerable package to its primary library, SCA Stitcher tries, in order:
 
-Do not commit company scan reports, generated Excel files, or ZIP exports. `.gitignore` is configured to keep common local reports and generated output folders out of the repo.
+1. The package's own `PackagePaths` dependency chain, preferring a direct dependency.
+2. Exact package ID.
+3. Package name and version.
+4. A unique package name.
+5. The manifest location, matched against direct packages in the same file or an
+   ancestor directory.
 
-If `schema_diagnostics.json` shows `packages_using_count_fallback`, the source report did not expose itemized CVE/CVSS data for those packages. The package is still retained, but the vulnerability column will say that details were not itemized in the source.
+Anything still unresolved is written to `unmapped_libraries.csv` and the Excel
+`Unmapped` sheet rather than being silently dropped or guessed at.
+
+Grouping rolls up related findings so a team sees one item instead of twenty: the same
+primary library at different versions collapses into one `Library Group`, and built-in
+rules group ecosystem clusters such as `eslint`, `eslint-plugin-react-hooks`, and
+`eslint-plugin-react-refresh` under `ESLint`, and BIRT-related findings under `BIRT`.
+Add your own with `--group-config`.
+
+Each row's vulnerability column holds only `CVE/Cx ID | CVSS score`, plus current
+version, latest version, and an `Is Latest?` flag for both the primary and the
+vulnerable library.
+
+## Web application
+
+An authenticated Docker web app for private, ephemeral report processing. Uploads,
+previews, exports, and report metadata are never persisted.
+
+Copy the environment template and set a strong secret:
+
+```powershell
+Copy-Item .env.example .env
+python -c "import secrets; print(secrets.token_hex(32))"
+```
+
+Paste the generated value after `SECRET_KEY=` in `.env`. Keep `.env` local; it is
+ignored by Git. Then build, provision an administrator, and start:
+
+```powershell
+docker compose build
+docker compose run --rm web flask --app web_app create-admin
+docker compose up
+```
+
+Open <http://localhost:8080> and upload a `.json` or `.zip` report. Preview the
+consolidated findings in the browser, print or save the preview as PDF, or download
+Excel, CSV, or standalone HTML. The named Docker volume holds only the
+local-development `users.db`; reports are processed in temporary storage and deleted
+when the request finishes.
+
+### Account management
+
+Local administrators manage accounts at `/admin`. Accounts created or reset there must
+replace their temporary password at the next sign-in.
+
+Reset a forgotten password from the server console:
+
+```powershell
+flask --app web_app reset-password
+```
+
+A plain reset deliberately does not change roles. If every administrator has lost the
+admin role, restore it on an existing account with `--grant-admin`:
+
+```powershell
+flask --app web_app list-admins
+flask --app web_app reset-password --grant-admin
+```
+
+## Security and deployment
+
+There is no HTTP first-account setup route: local accounts can only be provisioned
+from the CLI. Production refuses to start with local password authentication and
+requires verified AWS ALB OIDC/Cognito identity, secure cookies, a strong secret, and
+trusted hosts.
+
+- [Production security assessment](docs/security-assessment.md)
+- [AWS production guide](docs/aws-production.md)
+- [ECS task-definition example](aws/ecs-task-definition.example.json)
+
+Uploads default to a 25 MiB limit (`MAX_UPLOAD_BYTES`); JSON members extracted from ZIP
+uploads are capped to the same limit. Nesting depth, node count, package count, row
+count, request rate, and generated-output size are all bounded and configurable — see
+`.env.example`. CLI report parsing defaults to a 100 MiB JSON cap
+(`MAX_REPORT_BYTES`).
+
+Production dependencies are exact and hash-locked in `requirements.txt`; regenerate the
+lock from `requirements.in`. Development and audit tooling is isolated in
+`requirements-dev.txt`.
+
+## Development
+
+```powershell
+python -m pip install -r requirements-dev.txt
+python -m pytest
+```
+
+The suite covers authentication and role enforcement, CSRF, rate limiting, spreadsheet
+formula-injection neutralization, export sandboxing, report size and structure limits,
+ALB assertion verification, and concurrency guards on administrator role changes.
+
+## Notes
+
+Do not commit scan reports, generated workbooks, or ZIP exports. `.gitignore` already
+excludes the common local report and output paths.
+
+If `schema_diagnostics.json` reports `packages_using_count_fallback`, the source export
+did not itemize CVE/CVSS data for those packages. They are still included, but the
+vulnerability column will say the details were not itemized in the source.
