@@ -1,6 +1,6 @@
 # Production security assessment
 
-Assessment date: 2026-07-28 (second review round; first round 2026-07-27)
+Assessment date: 2026-07-28 (third review round; first round 2026-07-27)
 
 Scope: Flask application, report parsers and exporters, container image, dependency
 set, and the supplied AWS ECS deployment example.
@@ -40,11 +40,25 @@ set, and the supplied AWS ECS deployment example.
 | Minor | `reset-password --grant-admin` assembled its SQL by concatenation | Replaced with two complete statements selected by the flag. Nothing there was user-controlled, but the pattern does not belong in an auth path. |
 | Minor | Unreachable entries in `FORMULA_PREFIXES` and a dead `action` form fallback | Removed. Leading whitespace is stripped before the formula-prefix test, so the whitespace entries never applied. |
 
-Not changed, and deliberately so: `MAX_REPORT_ROWS` cheaply rejects row-multiplication
-shapes (an adversarial 1000-locations x 50-chains report is refused in under a second),
-and the ALB assertion checks the signed header `exp` before the signature purely as an
-early reject -- the JWS signature covers that header, so the verified decode remains
+The ALB assertion checks the signed header `exp` before the signature purely as an
+early reject; the JWS signature covers that header, so the verified decode remains
 authoritative.
+
+## Remediated in the third review round
+
+| Severity | Finding | Resolution |
+| --- | --- | --- |
+| Major | Transitive packages were mapped to unrelated direct packages sharing a repository root | Direct packages were indexed under *every* ancestor of their location with `setdefault()`, so a shared root such as `services` resolved to whichever direct package was indexed first: a transitive package under `services/worker` was reported as belonging to a direct package under `services/api`. A direct package now claims only its own location and, for a manifest file, the directory containing it. Lookups take the most specific scope with exactly one claimant; several claimants are reported as `ambiguous location scope` and left unmapped, because naming one would tell a developer to upgrade the wrong library. Results no longer depend on package order. |
+| Major | Resource limits were applied after expensive expansion | A content budget (`MAX_REPORT_CONTENT_CHARS`) is now accumulated while rows are built, so a report that amplifies kilobytes of input into megabytes of cells is stopped before any format is serialized. CSV serialization checks its size while writing rather than afterwards. The default sits above a full `MAX_REPORT_ROWS` report of ordinary width, measured at roughly 350 characters per row, so the two limits do not contradict each other. |
+| Major | `MAX_JSON_NODES` counted only containers, so a list of a million scalars passed a limit of two | Every JSON value is counted, in both `validate_json_structure` and `recursive_dicts`, and the check runs after each child scan rather than only when popping — a trailing run of scalars previously emptied the stack and exited unchecked. Scalars are counted without being pushed, so a wide array cannot grow the traversal stack. The default is raised to two million to match the new semantics. |
+| Major | ZIP uploads had no member-count limit and sorted every member name | `MAX_ZIP_MEMBERS` (default 10,000) is checked before any per-member work, and the report member is selected in a single linear pass instead of sorting the full list. A 5.7 MiB archive declaring 60,001 members is now rejected. |
+| Major | Malformed report shapes escaped as internal errors while operational failures were reported as bad input | `Packages` entries and `RiskReportSummary` are validated at the parser boundary and raise `ReportError` with the offending position; `{"Packages": [1]}` previously reached `PackageRef.from_obj()` and returned a logged 500. `Infinity`/`NaN` are rejected at parse, and `as_int` handles the float infinity that a literal such as `1e400` produces without going through `parse_constant`. `OSError` is no longer caught as invalid input, so a full disk or permission failure reaches the logged 500 path and stays visible to monitoring. |
+
+Two findings raised in the third round were already resolved in the second and were
+re-confirmed rather than changed: vulnerability extraction walks each package exactly
+once (verified at 50 walks for 50 packages in both the count-based and detail-based
+branches), and the Bandit B608 warning on `reset-password` is gone, with the tool
+exiting successfully.
 
 ## Deployment findings
 
@@ -67,11 +81,13 @@ evidence.
 
 ## Verification performed
 
-- `pytest`: 64 passing security and behavior tests, including repeated-trial
+- `pytest`: 85 passing security and behavior tests, including repeated-trial
   concurrency tests for the administrator role and delete guards, CSRF rejection on
   every state-changing route, non-admin rejection on every admin mutation, preview
   row bounds, audit attribution and log-injection resistance, forwarded-header trust,
-  limiter eviction, and ALB signing-key fetch deduplication.
+  limiter eviction, ALB signing-key fetch deduplication, location-mapping
+  ambiguity and order independence, scalar-aware structural budgets, ZIP member
+  caps, and the invalid-input versus operational-failure boundary.
 - `bandit`: no findings in the web app, verifier, or exposed consolidator.
 - `ruff check --select F,E9`: clean.
 - `pip-audit`: no known vulnerabilities in the production lock file.

@@ -69,11 +69,20 @@ To resolve a vulnerable package to its primary library, SCA Stitcher tries, in o
 2. Exact package ID.
 3. Package name and version.
 4. A unique package name.
-5. The manifest location, matched against direct packages in the same file or an
-   ancestor directory.
+5. The manifest location. A direct package covers its own location and, when that
+   location is a file, the directory containing it — so `services/api/pom.xml` covers
+   `services/api`. The most specific covering location wins, and it must have exactly
+   one direct package claiming it.
+
+Step 5 deliberately does not walk further up the tree. Matching on a shared repository
+root would let a transitive package under `services/worker` be attributed to an
+unrelated direct package under `services/api`, which points a developer at the wrong
+upgrade. For the same reason, when several direct packages share one manifest the
+result is recorded as ambiguous rather than resolved to an arbitrary one of them.
 
 Anything still unresolved is written to `unmapped_libraries.csv` and the Excel
-`Unmapped` sheet rather than being silently dropped or guessed at.
+`Unmapped` sheet rather than being silently dropped or guessed at. The `Mapping Source`
+column records which step produced each row, including `ambiguous location scope`.
 
 Grouping rolls up related findings so a team sees one item instead of twenty: the same
 primary library at different versions collapses into one `Library Group`, and built-in
@@ -145,7 +154,9 @@ trusted hosts.
 Uploads default to a 25 MiB limit (`MAX_UPLOAD_BYTES`); JSON members extracted from ZIP
 uploads are capped to the same limit. Nesting depth, node count, package count, row
 count, request rate, and generated-output size are all bounded and configurable — see
-`.env.example`. CLI report parsing defaults to a 100 MiB JSON cap
+`.env.example`; `MAX_JSON_NODES` counts every JSON value, scalars included, and
+`MAX_REPORT_CONTENT_CHARS` bounds total generated cell content while rows are built so
+no export format can be materialized beyond it. CLI report parsing defaults to a 100 MiB JSON cap
 (`MAX_REPORT_BYTES`); that variable applies to the CLI only, not to the web service.
 
 The in-browser preview renders at most `MAX_PREVIEW_ROWS` rows (default 2000) and says
@@ -168,8 +179,8 @@ The suite covers authentication and role enforcement, CSRF rejection on every
 state-changing route, rate limiting, spreadsheet formula-injection neutralization,
 export sandboxing, report size and structure limits, preview row bounds, audit-record
 attribution and log-injection resistance, forwarded-header trust, ALB assertion
-verification and signing-key cache behavior, and concurrency guards on administrator
-role changes.
+verification and signing-key cache behavior, concurrency guards on administrator
+role changes, and dependency-location mapping including ambiguous and unrelated paths.
 
 ## Notes
 
